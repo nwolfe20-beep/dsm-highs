@@ -581,6 +581,13 @@ def xmpp_connect():
                                     "trimming")
                         buf = buf[-131072:]
 
+                    # DIAGNOSTIC: show what is actually arriving. Stop
+                    # guessing at the parser — look at the wire.
+                    if chunks in (5, 50, 200) or chunks % 1000 == 0:
+                        sample = buf[-1500:].decode('utf-8', errors='ignore')
+                        log.info("RAW@%d (last 1500B):\n%s\n--- end raw ---",
+                                 chunks, sample)
+
                     if chunks % 500 == 0:
                         log.info("%d chunks | %d products seen | %d distinct DSM/CLI ids",
                                  chunks, len(_all_products_seen), len(_all_ids_seen))
