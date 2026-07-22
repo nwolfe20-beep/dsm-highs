@@ -138,6 +138,7 @@ ALL_TARGETS.update(CLI_TARGETS)
 _seen_today = {}     # (station, date) -> {'prov': f, 'conf': f}
 _all_ids_seen = {}       # DSM/CLI only
 _all_products_seen = {}  # every product id, proves the wire is flowing
+_processed = set()       # (awipsid, issue) dedup for the re-scan buffer
 
 
 # ---------------------------------------------------------------- telegram
@@ -303,6 +304,12 @@ def handle_product(awipsid, cccc, issue, text):
     cfg = ALL_TARGETS.get(awipsid.upper())
     if not cfg:
         return
+    # dedup: the buffer re-scans, so guard against processing the same
+    # product twice (same id + same issue time).
+    _dedup_key = (awipsid.upper(), issue)
+    if _dedup_key in _processed:
+        return
+    _processed.add(_dedup_key)
 
     now = datetime.now(timezone.utc)
     is_cli = awipsid.upper().startswith('CLI')
@@ -394,7 +401,13 @@ def handle_product(awipsid, cccc, issue, text):
                yes_ask_c=yes_c, depth=depth)
 
     # ---- gate
-    if stale >= 1:
+    if is_cli:
+        # CLI is the SETTLEMENT source, but by the time today's CLI lands the
+        # market is typically done. Log it so we can measure whether CLIs ever
+        # arrive early enough to be tradeable — but never fire on one. DSM is
+        # the signal; CLI is the scoreboard.
+        fire, why = False, 'CLI — log only, DSM fires'
+    elif stale >= 1:
         fire, why = False, f'product is for {cday}, {stale}d old — not today'
     elif confirmed == 'no':
         fire, why = False, 'provisional (pre-peak DSM) — watch only'
@@ -410,6 +423,12 @@ def handle_product(awipsid, cccc, issue, text):
     row['reason'] = why
     row['decision'] = 'PAPER_BUY' if fire else 'SKIP'
     write_row(row)
+
+    if is_cli:
+        # scoreboard, not a signal — one quiet line
+        telegram(f"📋 {cfg['name']} CLI settled max <b>{final_f}°F</b> "
+                 f"({cday}) — reference only")
+        return
 
     tag = ('📝 <b>PAPER BUY</b>' if fire else '⏭️ SKIP')
     telegram(
@@ -471,12 +490,18 @@ def parse_nwws_message(data_bytes):
             continue
         awipsid = aid.group(1)
 
-        # Visibility: count EVERY product id so we can prove the wire is
-        # flowing, and learn the real DSM/CLI ids instead of guessing.
+        # Visibility: count EVERY product id.
         _all_products_seen[awipsid] = _all_products_seen.get(awipsid, 0) + 1
-        if awipsid.startswith(('DSM', 'CLI')):
+        # DIAGNOSTIC: DSMs are confirmed to exist (Austin dropped one) but
+        # aren't appearing as 'DSM...'. So log ANY id containing 'DSM'
+        # anywhere, plus anything for our target stations under any prefix.
+        our_stations = {'DEN','PHX','SEA','LAS','AUS','HOU','DFW','OKC',
+                        'MSP','MIA','NYC','LAX','MDW','PHL','ATL','BOS','DCA'}
+        tail = awipsid[3:] if len(awipsid) > 3 else ''
+        if 'DSM' in awipsid or awipsid.startswith(('DSM', 'CLI')) or \
+           tail in our_stations:
             _all_ids_seen[awipsid] = _all_ids_seen.get(awipsid, 0) + 1
-            log.info("*** %s product: %s (%s) ***", awipsid[:3], awipsid,
+            log.info("*** product: %s (%s) ***", awipsid,
                      ccc.group(1) if ccc else '?')
 
         if awipsid.upper() in ALL_TARGETS:
@@ -619,19 +644,16 @@ def xmpp_connect():
                     text = buf.decode('utf-8', errors='ignore')
                     answer_pings(sock, text, send)
 
-                    # Only consume COMPLETE </x> stanzas. Do NOT truncate
-                    # on the mere presence of 'nwws-oi' — that string is in
-                    # every room JID and chops products mid-arrival.
-                    consumed = parse_nwws_message(buf)
-                    if consumed:
+                    # Re-scan a rolling window (like the proven old bot) so we
+                    # NEVER trim past a stanza we haven't parsed. Dedup in
+                    # handle_product prevents double-firing. Keeping a generous
+                    # 256KB tail means a large product still fully assembles.
+                    if b'nwws-oi' in buf:
                         last_product = time.time()
-                        buf = buf[consumed:]
-                    elif len(buf) > 1_000_000:
-                        # runaway with no complete stanza: keep the tail in
-                        # case a stanza is still arriving, drop the rest
-                        log.warning("buffer 1MB with no complete stanza — "
-                                    "trimming")
-                        buf = buf[-131072:]
+                        parse_nwws_message(buf)
+                        buf = buf[-262144:] if len(buf) > 262144 else buf
+                    elif len(buf) > 262144:
+                        buf = buf[-262144:]
 
                     # DIAGNOSTIC: show what is actually arriving. Stop
                     # guessing at the parser — look at the wire.
