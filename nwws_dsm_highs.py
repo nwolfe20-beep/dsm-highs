@@ -392,12 +392,24 @@ def answer_pings(sock, text, send):
 
 
 def parse_nwws_message(data_bytes):
-    """Product text lives in <x xmlns='nwws-oi'>, NOT <body>."""
+    """Product text lives in <x xmlns='nwws-oi'>, NOT <body>.
+
+    Returns the byte offset of the end of the LAST COMPLETE </x> stanza, so
+    the caller can discard only what it has fully consumed.
+
+    THIS IS THE BUG THAT KILLED THE OLD BOT: the room JID itself contains the
+    string 'nwws-oi', so a naive `if b'nwws-oi' in buf: truncate` fires on
+    every stanza — including partial ones — and chops the opening
+    <x xmlns='nwws-oi' awipsid=...> tag off multi-KB products before the rest
+    arrives. Nothing ever parses. Only discard COMPLETE stanzas.
+    """
     text = data_bytes.decode('utf-8', errors='ignore')
     if 'nwws-oi' not in text:
-        return
+        return 0
+    last_end = 0
     pattern = r'<x[^>]+xmlns=["\']nwws-oi["\'][^>]*>(.*?)</x>'
     for match in re.finditer(pattern, text, re.DOTALL):
+        last_end = match.end()
         full_x = match.group(0)
         product_text = match.group(1).strip()
         aid = re.search(r'awipsid=["\']([A-Z0-9]+)["\']', full_x)
@@ -418,6 +430,7 @@ def parse_nwws_message(data_bytes):
         if awipsid.upper() in ALL_TARGETS:
             handle_product(awipsid, ccc.group(1) if ccc else '',
                            iss.group(1) if iss else '', product_text)
+    return last_end
 
 
 def xmpp_connect():
@@ -554,12 +567,19 @@ def xmpp_connect():
                     text = buf.decode('utf-8', errors='ignore')
                     answer_pings(sock, text, send)
 
-                    if b'nwws-oi' in buf:
+                    # Only consume COMPLETE </x> stanzas. Do NOT truncate
+                    # on the mere presence of 'nwws-oi' — that string is in
+                    # every room JID and chops products mid-arrival.
+                    consumed = parse_nwws_message(buf)
+                    if consumed:
                         last_product = time.time()
-                        parse_nwws_message(buf)
-                        buf = buf[-4096:]
-                    elif len(buf) > 65536:
-                        buf = buf[-4096:]
+                        buf = buf[consumed:]
+                    elif len(buf) > 1_000_000:
+                        # runaway with no complete stanza: keep the tail in
+                        # case a stanza is still arriving, drop the rest
+                        log.warning("buffer 1MB with no complete stanza — "
+                                    "trimming")
+                        buf = buf[-131072:]
 
                     if chunks % 500 == 0:
                         log.info("%d chunks | %d products seen | %d distinct DSM/CLI ids",
