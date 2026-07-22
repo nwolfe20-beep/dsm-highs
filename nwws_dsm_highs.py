@@ -136,7 +136,8 @@ ALL_TARGETS.update(CLI_TARGETS)
 
 # remembers today's readings so we can do max(provisional, confirmed)
 _seen_today = {}     # (station, date) -> {'prov': f, 'conf': f}
-_all_ids_seen = {}   # awipsid -> count, so we LEARN the real ids
+_all_ids_seen = {}       # DSM/CLI only
+_all_products_seen = {}  # every product id, proves the wire is flowing
 
 
 # ---------------------------------------------------------------- telegram
@@ -406,9 +407,13 @@ def parse_nwws_message(data_bytes):
             continue
         awipsid = aid.group(1)
 
-        # LEARN the ids: count every DSM/CLI we see, tracked or not.
+        # Visibility: count EVERY product id so we can prove the wire is
+        # flowing, and learn the real DSM/CLI ids instead of guessing.
+        _all_products_seen[awipsid] = _all_products_seen.get(awipsid, 0) + 1
         if awipsid.startswith(('DSM', 'CLI')):
             _all_ids_seen[awipsid] = _all_ids_seen.get(awipsid, 0) + 1
+            log.info("*** %s product: %s (%s) ***", awipsid[:3], awipsid,
+                     ccc.group(1) if ccc else '?')
 
         if awipsid.upper() in ALL_TARGETS:
             handle_product(awipsid, ccc.group(1) if ccc else '',
@@ -557,8 +562,8 @@ def xmpp_connect():
                         buf = buf[-4096:]
 
                     if chunks % 500 == 0:
-                        log.info(f"{chunks} chunks — healthy, "
-                                 f"{len(_all_ids_seen)} distinct DSM/CLI ids")
+                        log.info("%d chunks | %d products seen | %d distinct DSM/CLI ids",
+                                 chunks, len(_all_products_seen), len(_all_ids_seen))
                 except socket.timeout:
                     try:
                         send(sock, ' ')
