@@ -139,6 +139,7 @@ _seen_today = {}     # (station, date) -> {'prov': f, 'conf': f}
 _all_ids_seen = {}       # DSM/CLI only
 _all_products_seen = {}  # every product id, proves the wire is flowing
 _processed = set()       # (awipsid, issue) dedup for the re-scan buffer
+_vis_logged = set()      # (awipsid, issue) dedup for the visibility log
 
 
 # ---------------------------------------------------------------- telegram
@@ -217,6 +218,28 @@ def parse_climate_date(text):
             return _date(int(m.group(3)), mon, int(m.group(2)))
         except ValueError:
             continue
+    return None
+
+
+def decode_dsm_max(text):
+    """Decode a coded DSM (NOT plain text — that was the bug).
+
+    A DSM looks like:
+        KRFD DS 1600 27/01 451521/ 140631// 45/ 14//9731559/00/...
+                           ^^^ ^^^^ max=45F at time 1521
+    The first field after <dd/mm> is <MAX><HHMM>/, second is <MIN><HHMM>/.
+    Temps are 2-3 digits. Returns max_f or None.
+
+    This is why the plain-text parse_maximum() never matched a DSM: the
+    string 'MAXIMUM TEMPERATURE' does not appear in a DSM at all.
+    """
+    m = re.search(
+        r'\bDS\s+\d{3,4}\s+\d{2}/\d{2}\s+(\d{2,3})(\d{4})/',
+        text)
+    if m:
+        v = int(m.group(1))
+        if -60 <= v <= 140:
+            return v
     return None
 
 
@@ -314,14 +337,17 @@ def handle_product(awipsid, cccc, issue, text):
     now = datetime.now(timezone.utc)
     is_cli = awipsid.upper().startswith('CLI')
     ptype = 'CLI' if is_cli else 'DSM'
-    max_f = parse_maximum(text)
+
+    # DSMs are CODED numeric strings; CLIs are plain text. Different decoders.
+    if is_cli:
+        max_f = parse_maximum(text)
+    else:
+        max_f = decode_dsm_max(text)
 
     if max_f is None:
-        # Don't guess — surface the raw text so we can fix the pattern.
-        log.warning("%s %s — no MAXIMUM found. First 300 chars:\n%s",
+        log.warning("%s %s — could not parse max. First 300 chars:\n%s",
                     ptype, cfg['name'], text[:300])
-        telegram(f"⚠️ {cfg['name']} {ptype} — no MAXIMUM parsed. "
-                 f"Check logs for the raw text so we can fix the pattern.")
+        telegram(f"⚠️ {cfg['name']} {ptype} — no max parsed. Raw in logs.")
         return
 
     idt = issue_to_dt(issue) or now
@@ -490,19 +516,23 @@ def parse_nwws_message(data_bytes):
             continue
         awipsid = aid.group(1)
 
-        # Visibility: count EVERY product id.
+        # Visibility with dedup on (id, issue) so the re-scan buffer doesn't
+        # spam the same product every recv.
         _all_products_seen[awipsid] = _all_products_seen.get(awipsid, 0) + 1
-        # DIAGNOSTIC: DSMs are confirmed to exist (Austin dropped one) but
-        # aren't appearing as 'DSM...'. So log ANY id containing 'DSM'
-        # anywhere, plus anything for our target stations under any prefix.
+        _vis_key = (awipsid, iss.group(1) if iss else '')
         our_stations = {'DEN','PHX','SEA','LAS','AUS','HOU','DFW','OKC',
                         'MSP','MIA','NYC','LAX','MDW','PHL','ATL','BOS','DCA'}
+        our_offices = {'KBOU','KPSR','KSEW','KVEF','KEWX','KHGX','KFWD',
+                       'KOUN','KMPX','KMFL','KOKX','KLOX','KLOT','KPHI',
+                       'KFFC','KBOX','KLWX'}
         tail = awipsid[3:] if len(awipsid) > 3 else ''
-        if 'DSM' in awipsid or awipsid.startswith(('DSM', 'CLI')) or \
-           tail in our_stations:
+        office = ccc.group(1) if ccc else ''
+        interesting = ('DSM' in awipsid or tail in our_stations
+                       or office in our_offices)
+        if interesting and _vis_key not in _vis_logged:
+            _vis_logged.add(_vis_key)
             _all_ids_seen[awipsid] = _all_ids_seen.get(awipsid, 0) + 1
-            log.info("*** product: %s (%s) ***", awipsid,
-                     ccc.group(1) if ccc else '?')
+            log.info("*** product: %s office=%s ***", awipsid, office)
 
         if awipsid.upper() in ALL_TARGETS:
             handle_product(awipsid, ccc.group(1) if ccc else '',
