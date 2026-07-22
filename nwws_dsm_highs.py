@@ -183,6 +183,42 @@ def parse_maximum(text):
     return None
 
 
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY',
+     'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'])}
+
+
+def parse_climate_date(text):
+    """The date the product DESCRIBES, which is NOT the issue date.
+
+    A CLI issued at 12:17Z on Jul 22 is the summary for Jul 21. Using the
+    issue date matched yesterday's 90F high against TODAY's market and the
+    gate called it 'confirmed + cheap' at 3c. Caught on paper; would have
+    swept 23 contracts on the wrong day live.
+
+    Returns a date, or None. None means SKIP — we do not guess.
+    """
+    pats = [
+        r'CLIMATE\s+SUMMARY\s+FOR\s+([A-Z]+)\s+(\d{1,2})\s+(\d{4})',
+        r'CLIMATE\s+REPORT\s+FOR\s+([A-Z]+)\s+(\d{1,2})\s+(\d{4})',
+        r'SUMMARY\s+FOR\s+([A-Z]+)\s+(\d{1,2})\s+(\d{4})',
+        r'\bFOR\s+([A-Z]{3,9})\s+(\d{1,2})\s+(\d{4})\b',
+    ]
+    from datetime import date as _date
+    for pat in pats:
+        m = re.search(pat, text, re.IGNORECASE)
+        if not m:
+            continue
+        mon = MONTHS.get(m.group(1).upper())
+        if not mon:
+            continue
+        try:
+            return _date(int(m.group(3)), mon, int(m.group(2)))
+        except ValueError:
+            continue
+    return None
+
+
 def issue_to_dt(issue):
     """'2026-07-21T23:17:00Z' -> datetime, or None."""
     try:
@@ -283,7 +319,21 @@ def handle_product(awipsid, cccc, issue, text):
 
     idt = issue_to_dt(issue) or now
     lag = round((now - idt).total_seconds())
-    cday = idt.date()
+
+    # The climate day is what the product DESCRIBES, not when it was issued.
+    # Morning CLIs summarize YESTERDAY. Refuse to guess.
+    cday = parse_climate_date(text)
+    if cday is None:
+        log.warning("%s %s — could not parse climate date, SKIPPING. "
+                    "First 300 chars:\n%s", ptype, cfg['name'], text[:300])
+        telegram(f"⚠️ {cfg['name']} {ptype} — no climate date parsed, "
+                 f"skipped. Raw text in logs.")
+        return
+
+    stale = (now.date() - cday).days
+    if stale >= 1:
+        log.info("%s %s is for %s (%d day(s) back) — not today's market",
+                 ptype, cfg['name'], cday, stale)
 
     # provisional vs confirmed, from the aim table
     hh, mm = cfg['confirmed_after_z']
@@ -344,7 +394,9 @@ def handle_product(awipsid, cccc, issue, text):
                yes_ask_c=yes_c, depth=depth)
 
     # ---- gate
-    if confirmed == 'no':
+    if stale >= 1:
+        fire, why = False, f'product is for {cday}, {stale}d old — not today'
+    elif confirmed == 'no':
         fire, why = False, 'provisional (pre-peak DSM) — watch only'
     elif yes_c is None:
         fire, why = False, 'no price'
