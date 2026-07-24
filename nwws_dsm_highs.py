@@ -141,6 +141,9 @@ _all_products_seen = {}  # every product id, proves the wire is flowing
 _processed = set()       # (awipsid, issue) dedup for the re-scan buffer
 _vis_logged = set()      # (awipsid, issue) dedup for the visibility log
 _dsm_samples_sent = 0    # push first few raw DSMs to telegram for calibration
+_hunt_sent = 0           # hunt-mode telegram counter
+_hunt_seen = set()       # dedup hunt ids
+def _hunt_key(aid): return aid[:6]
 
 
 # ---------------------------------------------------------------- telegram
@@ -220,6 +223,24 @@ def parse_climate_date(text):
         except ValueError:
             continue
     return None
+
+
+def decode_dsm_date(text, issue_dt):
+    """A DSM body carries 'DD/MM' after the DS marker:
+        KMIA DS 2009 24/07 911547/ ...   -> day 24, month 07
+    Returns a date. Uses issue year (DSMs don't carry the year). If the
+    DD/MM can't be found, falls back to the issue date's date.
+    """
+    from datetime import date as _date
+    m = re.search(r'\bDS\s+\d{3,4}\s+(\d{2})/(\d{2})\b', text)
+    if m:
+        dd, mm = int(m.group(1)), int(m.group(2))
+        yr = issue_dt.year if issue_dt else _date.today().year
+        try:
+            return _date(yr, mm, dd)
+        except ValueError:
+            pass
+    return issue_dt.date() if issue_dt else None
 
 
 def decode_dsm_max(text):
@@ -355,8 +376,12 @@ def handle_product(awipsid, cccc, issue, text):
     lag = round((now - idt).total_seconds())
 
     # The climate day is what the product DESCRIBES, not when it was issued.
-    # Morning CLIs summarize YESTERDAY. Refuse to guess.
-    cday = parse_climate_date(text)
+    # CLIs carry it as text ('SUMMARY FOR JULY 24 2026'); DSMs carry it as
+    # coded 'DD/MM'. Use the right decoder for each.
+    if is_cli:
+        cday = parse_climate_date(text)
+    else:
+        cday = decode_dsm_date(text, idt)
     if cday is None:
         log.warning("%s %s — could not parse climate date, SKIPPING. "
                     "First 300 chars:\n%s", ptype, cfg['name'], text[:300])
@@ -510,12 +535,24 @@ def parse_nwws_message(data_bytes):
         last_end = match.end()
         full_x = match.group(0)
         product_text = match.group(1).strip()
-        aid = re.search(r'awipsid=["\']([A-Z0-9]+)["\']', full_x)
-        ccc = re.search(r'cccc=["\']([A-Z0-9]+)["\']', full_x)
+        # awipsid can be missing, spaced, or lowercase on some products
+        # (notably DSMs, which killed the old assumption). Allow spaces and
+        # any case, then normalise. If still absent, DON'T skip — try to
+        # recover the id from the product body's first line (e.g. 'KMIA DS').
+        aid = re.search(r'awipsid=["\']([A-Za-z0-9 ]+)["\']', full_x)
+        ccc = re.search(r'cccc=["\']([A-Za-z0-9]+)["\']', full_x)
         iss = re.search(r'issue=["\']([^"\']+)["\']', full_x)
-        if not aid:
-            continue
-        awipsid = aid.group(1)
+        if aid:
+            awipsid = aid.group(1).replace(' ', '').upper()
+        else:
+            # recover: a DSM body starts '<SID> DS <time>'. Build DSM<SID>.
+            mds = re.match(r'\s*([A-Z]{3,4})\s+DS\b', product_text)
+            if mds:
+                sid = mds.group(1)
+                sid = sid[1:] if len(sid) == 4 and sid[0] == 'K' else sid
+                awipsid = 'DSM' + sid
+            else:
+                continue
 
         # Visibility with dedup on (id, issue) so the re-scan buffer doesn't
         # spam the same product every recv.
@@ -528,9 +565,19 @@ def parse_nwws_message(data_bytes):
                        'KFFC','KBOX','KLWX'}
         tail = awipsid[3:] if len(awipsid) > 3 else ''
         office = ccc.group(1) if ccc else ''
-        # ONLY DSM/CLI. The office-wide net flooded the log with AFD/SYN/ZFP
-        # noise and buried the products we actually want to see.
+        # ONLY DSM/CLI for the normal log.
         interesting = awipsid.startswith(('DSM', 'CLI'))
+
+        # HUNT MODE: the DSM is confirmed on-wire but not being caught, so it
+        # must arrive under an id we don't expect. Push EVERY product id from
+        # the target offices to Telegram until we spot the DSM's real id.
+        global _hunt_sent
+        hunt_offices = {'KMFL', 'KBOU', 'KEWX', 'KPSR'}   # Miami, Denver, Austin, Phoenix
+        if office in hunt_offices and _hunt_key(awipsid) not in _hunt_seen:
+            _hunt_seen.add(_hunt_key(awipsid))
+            if _hunt_sent < 60:
+                _hunt_sent += 1
+                telegram(f"🔎 {office}: <b>{awipsid}</b>")
         if interesting and _vis_key not in _vis_logged:
             _vis_logged.add(_vis_key)
             _all_ids_seen[awipsid] = _all_ids_seen.get(awipsid, 0) + 1
