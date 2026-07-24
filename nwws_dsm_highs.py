@@ -140,6 +140,7 @@ _all_ids_seen = {}       # DSM/CLI only
 _all_products_seen = {}  # every product id, proves the wire is flowing
 _processed = set()       # (awipsid, issue) dedup for the re-scan buffer
 _vis_logged = set()      # (awipsid, issue) dedup for the visibility log
+_dsm_samples_sent = 0    # push first few raw DSMs to telegram for calibration
 
 
 # ---------------------------------------------------------------- telegram
@@ -527,12 +528,30 @@ def parse_nwws_message(data_bytes):
                        'KFFC','KBOX','KLWX'}
         tail = awipsid[3:] if len(awipsid) > 3 else ''
         office = ccc.group(1) if ccc else ''
-        interesting = ('DSM' in awipsid or tail in our_stations
-                       or office in our_offices)
+        # ONLY DSM/CLI. The office-wide net flooded the log with AFD/SYN/ZFP
+        # noise and buried the products we actually want to see.
+        interesting = awipsid.startswith(('DSM', 'CLI'))
         if interesting and _vis_key not in _vis_logged:
             _vis_logged.add(_vis_key)
             _all_ids_seen[awipsid] = _all_ids_seen.get(awipsid, 0) + 1
-            log.info("*** product: %s office=%s ***", awipsid, office)
+            if awipsid.startswith('DSM'):
+                # DSMs are coded — capture the raw string so the decoder can
+                # be calibrated against real products, not guesses.
+                body = product_text.strip().replace('\n', ' ')[:200]
+                decoded = decode_dsm_max(product_text)
+                log.info("*** DSM %s office=%s decoded_max=%s ***\n    RAW: %s",
+                         awipsid, office, decoded, body)
+                # Push the first few straight to Telegram so they don't have
+                # to be dug out of the log.
+                global _dsm_samples_sent
+                if _dsm_samples_sent < 5:
+                    _dsm_samples_sent += 1
+                    telegram(f"🔬 <b>DSM SAMPLE {_dsm_samples_sent}/5</b>\n"
+                             f"{awipsid} ({office})\n"
+                             f"decoded max: <b>{decoded}</b>\n"
+                             f"<code>{body[:180]}</code>")
+            else:
+                log.info("*** %s office=%s ***", awipsid, office)
 
         if awipsid.upper() in ALL_TARGETS:
             handle_product(awipsid, ccc.group(1) if ccc else '',
