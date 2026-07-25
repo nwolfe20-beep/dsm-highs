@@ -141,6 +141,7 @@ _all_products_seen = {}  # every product id, proves the wire is flowing
 _processed = set()       # (awipsid, issue) dedup for the re-scan buffer
 _vis_logged = set()      # (awipsid, issue) dedup for the visibility log
 _dsm_samples_sent = 0    # push first few raw DSMs to telegram for calibration
+_trap_sent = 0           # raw wire trap counter
 _hunt_sent = 0           # hunt-mode telegram counter
 _hunt_seen = set()       # dedup hunt ids
 def _hunt_key(aid): return aid[:6]
@@ -345,8 +346,23 @@ def write_row(d):
 
 
 # ---------------------------------------------------------------- handler
+# station SID (from DSM body 'Kxxx DS') -> config. This is how we ACTUALLY
+# match DSMs: by the site in the body, not the awipsid or issuing office,
+# because one office issues DSMs for many sites under SID-based ids.
+SID_TO_CFG = {}
+for _tk, _cfg in list(TARGETS.items()):
+    SID_TO_CFG[_cfg['station']] = _cfg          # e.g. 'DEN' -> Denver cfg
+
+
 def handle_product(awipsid, cccc, issue, text):
     cfg = ALL_TARGETS.get(awipsid.upper())
+    # If the awipsid isn't a known target, try matching a DSM by the station
+    # in its BODY ('KDEN DS ...' -> SID 'DEN'). This is the real matcher —
+    # DSMs arrive under SID-based ids issued by various offices.
+    if not cfg and awipsid.upper().startswith('DSM'):
+        mbody = re.match(r'\s*K?([A-Z]{3})\s+DS\b', text)
+        if mbody:
+            cfg = SID_TO_CFG.get(mbody.group(1))
     if not cfg:
         return
     # dedup: the buffer re-scans, so guard against processing the same
@@ -600,7 +616,9 @@ def parse_nwws_message(data_bytes):
             else:
                 log.info("*** %s office=%s ***", awipsid, office)
 
-        if awipsid.upper() in ALL_TARGETS:
+        # Route to handler if it's a known target OR any DSM (handler does
+        # body-based station matching for DSMs under SID-based ids).
+        if awipsid.upper() in ALL_TARGETS or awipsid.upper().startswith('DSM'):
             handle_product(awipsid, ccc.group(1) if ccc else '',
                            iss.group(1) if iss else '', product_text)
     return last_end
@@ -744,6 +762,25 @@ def xmpp_connect():
                     # NEVER trim past a stanza we haven't parsed. Dedup in
                     # handle_product prevents double-firing. Keeping a generous
                     # 256KB tail means a large product still fully assembles.
+                    # RAW DSM TRAP: if a chunk contains the coded-DSM
+                    # signature (' DS ' after a station id) or a DSM awipsid,
+                    # push the raw surrounding bytes to Telegram BEFORE any
+                    # parsing, so we see exactly what's on the wire. This is
+                    # the one thing offline tests can't reproduce.
+                    global _trap_sent
+                    low = chunk.decode('utf-8', errors='ignore')
+                    if _trap_sent < 8 and ('DSM' in low or
+                            re.search(r'\bK[A-Z]{3}\s+DS\s+\d', low)):
+                        _trap_sent += 1
+                        # grab context around the hit
+                        idx = low.find('DSM')
+                        if idx < 0:
+                            idx = re.search(r'\bK[A-Z]{3}\s+DS\s+\d', low).start()
+                        snippet = low[max(0, idx-120):idx+200]
+                        telegram(f"🪤 <b>RAW WIRE TRAP {_trap_sent}/8</b>\n"
+                                 f"<code>{snippet}</code>")
+                        log.info("RAW WIRE TRAP: %s", snippet)
+
                     if b'nwws-oi' in buf:
                         last_product = time.time()
                         parse_nwws_message(buf)
