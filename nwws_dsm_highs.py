@@ -360,9 +360,11 @@ def handle_product(awipsid, cccc, issue, text):
     # in its BODY ('KDEN DS ...' -> SID 'DEN'). This is the real matcher —
     # DSMs arrive under SID-based ids issued by various offices.
     if not cfg and awipsid.upper().startswith('DSM'):
-        mbody = re.match(r'\s*K?([A-Z]{3})\s+DS\b', text)
+        mbody = re.search(r'\bK?([A-Z]{3})\s+DS\s+\d', text)
         if mbody:
-            cfg = SID_TO_CFG.get(mbody.group(1))
+            sid = mbody.group(1)
+            sid = sid[1:] if len(sid) == 4 and sid[0] == 'K' else sid
+            cfg = SID_TO_CFG.get(sid)
     if not cfg:
         return
     # dedup: the buffer re-scans, so guard against processing the same
@@ -562,7 +564,7 @@ def parse_nwws_message(data_bytes):
             awipsid = aid.group(1).replace(' ', '').upper()
         else:
             # recover: a DSM body starts '<SID> DS <time>'. Build DSM<SID>.
-            mds = re.match(r'\s*([A-Z]{3,4})\s+DS\b', product_text)
+            mds = re.search(r'\b(K?[A-Z]{3})\s+DS\s+\d', product_text)
             if mds:
                 sid = mds.group(1)
                 sid = sid[1:] if len(sid) == 4 and sid[0] == 'K' else sid
@@ -584,16 +586,6 @@ def parse_nwws_message(data_bytes):
         # ONLY DSM/CLI for the normal log.
         interesting = awipsid.startswith(('DSM', 'CLI'))
 
-        # HUNT MODE: the DSM is confirmed on-wire but not being caught, so it
-        # must arrive under an id we don't expect. Push EVERY product id from
-        # the target offices to Telegram until we spot the DSM's real id.
-        global _hunt_sent
-        hunt_offices = {'KMFL', 'KBOU', 'KEWX', 'KPSR'}   # Miami, Denver, Austin, Phoenix
-        if office in hunt_offices and _hunt_key(awipsid) not in _hunt_seen:
-            _hunt_seen.add(_hunt_key(awipsid))
-            if _hunt_sent < 60:
-                _hunt_sent += 1
-                telegram(f"🔎 {office}: <b>{awipsid}</b>")
         if interesting and _vis_key not in _vis_logged:
             _vis_logged.add(_vis_key)
             _all_ids_seen[awipsid] = _all_ids_seen.get(awipsid, 0) + 1
@@ -604,8 +596,6 @@ def parse_nwws_message(data_bytes):
                 decoded = decode_dsm_max(product_text)
                 log.info("*** DSM %s office=%s decoded_max=%s ***\n    RAW: %s",
                          awipsid, office, decoded, body)
-                # Push the first few straight to Telegram so they don't have
-                # to be dug out of the log.
                 global _dsm_samples_sent
                 if _dsm_samples_sent < 5:
                     _dsm_samples_sent += 1
@@ -758,42 +748,37 @@ def xmpp_connect():
                     text = buf.decode('utf-8', errors='ignore')
                     answer_pings(sock, text, send)
 
-                    # Re-scan a rolling window (like the proven old bot) so we
-                    # NEVER trim past a stanza we haven't parsed. Dedup in
-                    # handle_product prevents double-firing. Keeping a generous
-                    # 256KB tail means a large product still fully assembles.
-                    # RAW DSM TRAP: if a chunk contains the coded-DSM
-                    # signature (' DS ' after a station id) or a DSM awipsid,
-                    # push the raw surrounding bytes to Telegram BEFORE any
-                    # parsing, so we see exactly what's on the wire. This is
-                    # the one thing offline tests can't reproduce.
-                    global _trap_sent
-                    low = chunk.decode('utf-8', errors='ignore')
-                    if _trap_sent < 8 and ('DSM' in low or
-                            re.search(r'\bK[A-Z]{3}\s+DS\s+\d', low)):
-                        _trap_sent += 1
-                        # grab context around the hit
-                        idx = low.find('DSM')
-                        if idx < 0:
-                            idx = re.search(r'\bK[A-Z]{3}\s+DS\s+\d', low).start()
-                        snippet = low[max(0, idx-120):idx+200]
-                        telegram(f"🪤 <b>RAW WIRE TRAP {_trap_sent}/8</b>\n"
-                                 f"<code>{snippet}</code>")
-                        log.info("RAW WIRE TRAP: %s", snippet)
-
+                    # Drain COMPLETE stanzas from the FRONT of the buffer as
+                    # they arrive. DSMs come in dense bursts (30+ at 12:16Z);
+                    # the old 256KB rolling re-scan overflowed and the trim
+                    # chopped the front of the batch, losing all but a few.
+                    # Now: repeatedly pull the earliest complete
+                    # </message> (or </x></message>) off the front, process it,
+                    # and remove it — so no burst can overflow anything.
                     if b'nwws-oi' in buf:
                         last_product = time.time()
-                        parse_nwws_message(buf)
-                        buf = buf[-262144:] if len(buf) > 262144 else buf
-                    elif len(buf) > 262144:
-                        buf = buf[-262144:]
-
-                    # DIAGNOSTIC: show what is actually arriving. Stop
-                    # guessing at the parser — look at the wire.
-                    if chunks in (5, 50, 200) or chunks % 1000 == 0:
-                        sample = buf[-1500:].decode('utf-8', errors='ignore')
-                        log.info("RAW@%d (last 1500B):\n%s\n--- end raw ---",
-                                 chunks, sample)
+                    while True:
+                        end = buf.find(b'</message>')
+                        if end == -1:
+                            break
+                        end += len(b'</message>')
+                        stanza, buf = buf[:end], buf[end:]
+                        if b'nwws-oi' in stanza:
+                            parse_nwws_message(stanza)
+                    # safety: if no </message> yet but buffer is huge, the
+                    # stream may use bare stanzas — fall back to draining by
+                    # </x> so we still never accumulate unbounded.
+                    if len(buf) > 524288:
+                        while True:
+                            ex = buf.find(b'</x>')
+                            if ex == -1:
+                                break
+                            ex += len(b'</x>')
+                            chunk_s, buf = buf[:ex], buf[ex:]
+                            if b'nwws-oi' in chunk_s:
+                                parse_nwws_message(chunk_s)
+                        if len(buf) > 524288:
+                            buf = buf[-131072:]
 
                     if chunks % 500 == 0:
                         log.info("%d chunks | %d products seen | %d distinct DSM/CLI ids",
