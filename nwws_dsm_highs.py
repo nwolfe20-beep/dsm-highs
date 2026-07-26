@@ -1,85 +1,101 @@
 """
-nwws_dsm_highs.py — NWWS-OI DSM/CLI HIGH temperature bot. PAPER ONLY.
+nwws_cli_highs.py — NWWS-OI CLI (Daily Climate Report) HIGH temp bot. PAPER ONLY.
 
-WHY HIGHS AND NOT LOWS
-----------------------
-The earlier low version failed for a structural reason: DSMs fire on a fixed
-schedule, and the ones carrying a "low so far" fired BEFORE the true overnight
-minimum had formed. You were reading a number too early to be the real low.
+WHY CLI AND NOT DSM
+-------------------
+DSMs do not reach this feed. Confirmed over weeks of listening: CLIs arrive
+constantly for every watched city, DSMs never do. The previous version fired
+only on DSM, which made its fire path unreachable in practice. Everything here
+is built on the CLI stream, which is the product that actually shows up.
 
-That same timing works IN OUR FAVOR for highs. The daily max forms mid-
-afternoon (~3-4pm local). The afternoon DSMs fire AFTER that. So a post-peak
-DSM carries a high that has already happened.
+The provisional/confirmed structure below is the same one designed for DSMs.
+That design was correct — it was aimed at a product that never arrives.
 
-  Denver: peak 3-4pm local = 21-22Z.  DSMs at 22:17Z and 23:17Z.
-          -> 22:17Z = PROVISIONAL (right at peak's tail)
-          -> 23:17Z = CONFIRMED   (an hour past latest typical peak)
+HOW THE HIGH GETS LOCKED
+------------------------
+A daily CLI issued mid-afternoon is a RUNNING max ("VALID TODAY AS OF 0400 PM
+LOCAL TIME"), not a settled one. Firing on a running max is the low-side
+timing failure in reverse: read the number before the day is done and you
+trade a high that hasn't finished forming.
 
-CONFIRMED HIGH = max over every product seen for that station/day. If the
-provisional and confirmed readings agree, the high held across the hour —
-highest confidence.
+The CLI hands us the tool to solve this. The observed value comes with its
+observation time in the LST column:
+
+    MAXIMUM        103R   129 PM 100    1910  90     13       97
+                   ^^^^   ^^^^^^
+                   value  when it happened (LST)
+
+    issued  22:36Z
+    obs     129 PM LST = 13:29 = 20:29Z   (Denver LST = UTC-7)
+    staleness = 127 minutes
+
+The peak happened over two hours before the report was issued. That is the
+product telling us the high is behind us — not a guess from the wall clock.
+
+    STALENESS  = issue_utc - observation_utc
+    CONFIRMED  = staleness >= CLI_CONFIRM_STALE_MIN  (floor, default 90)
+                 AND issue >= the city's post-peak cutoff
+    FIRE       = CONFIRMED and (corroborated by a second CLI reporting the
+                 same max, OR staleness >= CLI_SOLO_STALE_MIN, default 150)
+
+Corroboration matters because a single parse has nothing checking it. Two
+consecutive independent CLIs agreeing on the same max IS a cross-check. If the
+max rises between reports, the peak is still forming — confirmation resets.
+
+LST IS TRUE STANDARD TIME
+-------------------------
+Verified against real products on 2026-07-26: the CLI reported 129 PM and
+Wethr showed 2:29 PM for the same observation. Exactly one hour apart, which
+is the DST offset. So the LST column is genuine standard time and the
+'lst_offset' values below are STANDARD offsets, never daylight. Getting this
+wrong shifts every staleness calculation by an hour in summer.
 
 WHAT THIS FILE DOES NOT DO
 --------------------------
 It does NOT import the order layer. No Kalshi key, no signing, no order path.
-It physically cannot trade. It catches DSMs, parses the max, matches the
-bracket, runs the gate, and LOGS. Prove the edge on paper first — the same
-discipline that kept the low side clean.
-
-AWIPS IDS ARE LEARNED, NOT GUESSED
-----------------------------------
-We don't know every city's exact DSM AWIPS id for certain (the old file had
-'DSMLSV' for Vegas, which may or may not be right). So this bot logs EVERY
-DSM/CLI product id it sees on the wire, whether or not we track it. After a
-day you read the log and you know the real ids instead of guessing.
-
-Connection guts (TLS, SASL, room, ping-answering) are carried over verbatim
-from the working low bot. Do not touch them — they were hard-won:
-  - room is 'nwws@conference...', NOT 'nwws-oi@conference...'
-  - server KICKS clients that don't answer <iq><ping/></iq>
-  - product text lives in the <x xmlns='nwws-oi'> stanza, not <body>
+It physically cannot trade. It catches CLIs, parses the observed max, gates
+it, and LOGS. Prove the edge on paper first.
 
 =============================================================================
-FIX 2026-07-26 — THE CLI COLUMN BUG
+THE PARSER BUG THIS FILE EXISTS TO NOT REPEAT (2026-07-26)
 =============================================================================
-On 2026-07-26 Denver's CLI reported an observed max of 103F (a record). The
-bot reported 90F. Root cause, confirmed by replaying the real product:
+Denver's CLI reported an observed max of 103F, a record. The bot reported 90F.
 
-The old first regex was
-    MAXIMUM\\s+TEMPERATURE\\s*\\(F\\)[^\\d]{0,80}?(\\d{1,3})
-
-In the TODAY block the words appear in the OPPOSITE order — the section
-header is 'TEMPERATURE (F)' and the row label underneath is 'MAXIMUM'. So
-that pattern never matched today's observation at all. The only place the
-literal phrase 'MAXIMUM TEMPERATURE (F)' appears in a daily CLI is the
-tomorrow-normals block at the bottom:
+The old regex looked for 'MAXIMUM TEMPERATURE (F)'. In the TODAY block the
+words run the other way — section header 'TEMPERATURE (F)', row label
+'MAXIMUM' underneath — so it never matched today's observation at all. The
+only place that literal phrase appears in a daily CLI is the bottom:
 
     THE DENVER CO CLIMATE NORMALS FOR TOMORROW
                              NORMAL    RECORD    YEAR
      MAXIMUM TEMPERATURE (F)   90        98      1964
 
-90 is TOMORROW'S CLIMATE NORMAL. The bot was reading a 30-year average and
-calling it a settled observation.
+90 was TOMORROW'S 30-YEAR CLIMATE NORMAL. Not an observation of anything.
 
-A second, independent landmine sat in the same row. The observed value prints
-as '103R' when a record is set or tied, so any pattern expecting bare digits
-followed by whitespace also fails on exactly the days with the biggest
-mispricing. Both are fixed below.
+Replay showed this hit on every day, not just record days — wherever the
+tomorrow-normals block exists, the old parser returned the normal. It survived
+for weeks because normals sit close to actuals, so the number always looked
+plausible. Denver running +13 is the only reason it surfaced.
 
-THREE GUARDS ADDED
+A second landmine sat in the same row: the value prints as '103R' when a
+record is set or tied, which breaks any pattern expecting bare digits followed
+by whitespace — on exactly the days with the biggest mispricing.
+
+Guards now in place:
   1. parse_cli_max() cuts the tomorrow-normals block, scopes to the TODAY
      TEMPERATURE section, anchors on the OBSERVED column (value + LST time),
-     tolerates the R/T flags, and returns None on MM rather than substituting
-     whatever number it can find. It refuses instead of guessing.
-  2. Preliminary CLIs are now flagged. This CLI said 'VALID TODAY AS OF 0400
-     PM LOCAL TIME' — a running max, not a settled one. The old code called
-     every CLI 'settled', which is what made the wrong number look official.
-  3. DSM/CLI cross-check. If both products for the same station and day report
-     a max and they disagree, that is a parser fault by definition — the two
-     products describe the same observation. It alerts loudly.
+     tolerates R/T flags, and returns None on MM. It REFUSES rather than
+     guessing. A skipped trade costs less than a 13F error.
+  2. Corroboration: no fire on a single unverified parse unless the
+     observation is very stale.
+  3. Sanity band on the parsed value, and a hard reset if the max ever
+     decreases (a running max cannot fall — that means a parse fault).
 
-The DSM decoder was NOT at fault: decode_dsm_max() returns 103 from the real
-2026-07-26 KDEN DSM. Verified by replay. Left unchanged.
+Connection guts (TLS, SASL, room, ping-answering) carried over verbatim from
+the working bot. Do not touch them — they were hard-won:
+  - room is 'nwws@conference...', NOT 'nwws-oi@conference...'
+  - server KICKS clients that don't answer <iq><ping/></iq>
+  - product text lives in the <x xmlns='nwws-oi'> stanza, not <body>
 """
 
 import os
@@ -92,10 +108,10 @@ import base64
 import time
 import logging
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [DSM] %(message)s')
-log = logging.getLogger('dsm')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [CLI] %(message)s')
+log = logging.getLogger('cli')
 
 # ---------------------------------------------------------------- connection
 NWWS_USERNAME = os.environ.get('NWWS_OI_USERNAME', 'noah.wolfe')
@@ -103,88 +119,87 @@ NWWS_PASSWORD = os.environ.get('NWWS_OI_PASSWORD', '')
 NWWS_SERVER = 'nwws-oi-cprk.weather.gov'
 NWWS_PORT = 5222
 NWWS_ROOM = 'nwws@conference.nwws-oi.weather.gov'
-NWWS_NICK = os.environ.get('NWWS_OI_NICK', 'dsmhigh1')
+NWWS_NICK = os.environ.get('NWWS_OI_NICK', 'clihigh1')
 
-TG_TOKEN = os.environ.get('DSM_TELEGRAM_TOKEN',
+TG_TOKEN = os.environ.get('CLI_TELEGRAM_TOKEN',
                           os.environ.get('TELEGRAM_BOT_TOKEN', ''))
-TG_CHAT = os.environ.get('DSM_TELEGRAM_CHAT_ID',
+TG_CHAT = os.environ.get('CLI_TELEGRAM_CHAT_ID',
                          os.environ.get('TELEGRAM_CHAT_ID', ''))
-LOG_PATH = os.environ.get('DSM_LOG', '/tmp/dsm_highs.csv')
+LOG_PATH = os.environ.get('CLI_LOG', '/tmp/cli_highs.csv')
 
 KALSHI = 'https://api.elections.kalshi.com/trade-api/v2'
-UA = {'User-Agent': 'dsm-highs/1.1'}
+UA = {'User-Agent': 'cli-highs/2.0'}
 
-# gate
-MAX_YES_PCT = int(os.environ.get('DSM_PRICE_CEILING_C', '55'))
+# ---------------------------------------------------------------- gate knobs
+# Price ceiling — above this the market has already repriced.
+MAX_YES_PCT = int(os.environ.get('CLI_PRICE_CEILING_C', '55'))
+# Minutes the observation must predate issuance before the high counts as
+# confirmed. Floor for everything.
+CONFIRM_STALE_MIN = int(os.environ.get('CLI_CONFIRM_STALE_MIN', '90'))
+# Above this staleness a single CLI may fire without a second one agreeing.
+SOLO_STALE_MIN = int(os.environ.get('CLI_SOLO_STALE_MIN', '150'))
 
 # ---------------------------------------------------------------- aim table
-# Per city: the verified Kalshi HIGH series, the local afternoon peak window,
-# and which DSM issue times are provisional vs confirmed.
-#
-# Peak windows are ~3-4pm local. DSM times from the published schedule.
-# 'confirmed_after_z' = the UTC hour:min at/after which a DSM is considered
-# post-peak for that city. A DSM before that is PROVISIONAL.
+# Per city: verified Kalshi HIGH series, the LST (STANDARD, never daylight)
+# UTC offset used to place the observation time, and the UTC cutoff at/after
+# which a CLI is considered post-peak for that city.
 #
 # Kalshi series tickers VERIFIED live 2026-07-19 (see kalshi_temp_map.py).
 # NOTE the T/no-T inconsistency is real: KXHIGHDEN but KXHIGHTPHX.
+#
+# confirmed_after_z is a backstop, not the primary test. Staleness is the
+# primary test. This just stops a freak early-morning report from qualifying.
 TARGETS = {
-    # awips id -> config
-    'DSMDEN': {'name': 'Denver',       'series': 'KXHIGHDEN',
-               'station': 'DEN', 'confirmed_after_z': (23, 0)},
-    'DSMPHX': {'name': 'Phoenix',      'series': 'KXHIGHTPHX',
-               'station': 'PHX', 'confirmed_after_z': (23, 0)},
-    'DSMSEA': {'name': 'Seattle',      'series': 'KXHIGHTSEA',
-               'station': 'SEA', 'confirmed_after_z': (0, 30)},
-    'DSMLAS': {'name': 'Las Vegas',    'series': 'KXHIGHTLV',
-               'station': 'LAS', 'confirmed_after_z': (0, 0)},
-    'DSMLSV': {'name': 'Las Vegas',    'series': 'KXHIGHTLV',
-               'station': 'LAS', 'confirmed_after_z': (0, 0)},
-    'DSMAUS': {'name': 'Austin',       'series': 'KXHIGHAUS',
-               'station': 'AUS', 'confirmed_after_z': (23, 0)},
-    'DSMHOU': {'name': 'Houston',      'series': 'KXHIGHTHOU',
-               'station': 'HOU', 'confirmed_after_z': (23, 0)},
-    'DSMDFW': {'name': 'Dallas',       'series': 'KXHIGHTDAL',
-               'station': 'DFW', 'confirmed_after_z': (23, 0)},
-    'DSMOKC': {'name': 'OKC',          'series': 'KXHIGHTOKC',
-               'station': 'OKC', 'confirmed_after_z': (23, 0)},
-    'DSMMSP': {'name': 'Minneapolis',  'series': 'KXHIGHTMIN',
-               'station': 'MSP', 'confirmed_after_z': (23, 0)},
-    'DSMMIA': {'name': 'Miami',        'series': 'KXHIGHMIA',
-               'station': 'MIA', 'confirmed_after_z': (21, 0)},
-    'DSMNYC': {'name': 'NYC',          'series': 'KXHIGHNY',
-               'station': 'NYC', 'confirmed_after_z': (21, 0)},
-    'DSMLAX': {'name': 'LA',           'series': 'KXHIGHLAX',
-               'station': 'LAX', 'confirmed_after_z': (1, 0)},
-    'DSMMDW': {'name': 'Chicago',      'series': 'KXHIGHCHI',
-               'station': 'MDW', 'confirmed_after_z': (22, 0)},
-    'DSMPHL': {'name': 'Philadelphia', 'series': 'KXHIGHPHIL',
-               'station': 'PHL', 'confirmed_after_z': (21, 0)},
-    'DSMATL': {'name': 'Atlanta',      'series': 'KXHIGHTATL',
-               'station': 'ATL', 'confirmed_after_z': (21, 0)},
-    'DSMBOS': {'name': 'Boston',       'series': 'KXHIGHTBOS',
-               'station': 'BOS', 'confirmed_after_z': (21, 0)},
-    'DSMDCA': {'name': 'Washington DC', 'series': 'KXHIGHTDC',
-               'station': 'DCA', 'confirmed_after_z': (21, 0)},
+    'CLIDEN': {'name': 'Denver',        'series': 'KXHIGHDEN',
+               'station': 'DEN', 'lst_offset': -7, 'confirmed_after_z': (21, 0)},
+    'CLIPHX': {'name': 'Phoenix',       'series': 'KXHIGHTPHX',
+               'station': 'PHX', 'lst_offset': -7, 'confirmed_after_z': (21, 0)},
+    'CLISEA': {'name': 'Seattle',       'series': 'KXHIGHTSEA',
+               'station': 'SEA', 'lst_offset': -8, 'confirmed_after_z': (22, 0)},
+    'CLILAS': {'name': 'Las Vegas',     'series': 'KXHIGHTLV',
+               'station': 'LAS', 'lst_offset': -8, 'confirmed_after_z': (22, 0)},
+    'CLIVEF': {'name': 'Las Vegas',     'series': 'KXHIGHTLV',
+               'station': 'LAS', 'lst_offset': -8, 'confirmed_after_z': (22, 0)},
+    'CLIAUS': {'name': 'Austin',        'series': 'KXHIGHAUS',
+               'station': 'AUS', 'lst_offset': -6, 'confirmed_after_z': (20, 0)},
+    'CLIHOU': {'name': 'Houston',       'series': 'KXHIGHTHOU',
+               'station': 'HOU', 'lst_offset': -6, 'confirmed_after_z': (20, 0)},
+    'CLIDFW': {'name': 'Dallas',        'series': 'KXHIGHTDAL',
+               'station': 'DFW', 'lst_offset': -6, 'confirmed_after_z': (20, 0)},
+    'CLIOKC': {'name': 'OKC',           'series': 'KXHIGHTOKC',
+               'station': 'OKC', 'lst_offset': -6, 'confirmed_after_z': (20, 0)},
+    'CLIMSP': {'name': 'Minneapolis',   'series': 'KXHIGHTMIN',
+               'station': 'MSP', 'lst_offset': -6, 'confirmed_after_z': (20, 0)},
+    'CLIMIA': {'name': 'Miami',         'series': 'KXHIGHMIA',
+               'station': 'MIA', 'lst_offset': -5, 'confirmed_after_z': (19, 0)},
+    'CLINYC': {'name': 'NYC',           'series': 'KXHIGHNY',
+               'station': 'NYC', 'lst_offset': -5, 'confirmed_after_z': (19, 0)},
+    'CLILAX': {'name': 'LA',            'series': 'KXHIGHLAX',
+               'station': 'LAX', 'lst_offset': -8, 'confirmed_after_z': (22, 0)},
+    'CLIMDW': {'name': 'Chicago',       'series': 'KXHIGHCHI',
+               'station': 'MDW', 'lst_offset': -6, 'confirmed_after_z': (20, 0)},
+    'CLIPHL': {'name': 'Philadelphia',  'series': 'KXHIGHPHIL',
+               'station': 'PHL', 'lst_offset': -5, 'confirmed_after_z': (19, 0)},
+    'CLIATL': {'name': 'Atlanta',       'series': 'KXHIGHTATL',
+               'station': 'ATL', 'lst_offset': -5, 'confirmed_after_z': (19, 0)},
+    'CLIBOS': {'name': 'Boston',        'series': 'KXHIGHTBOS',
+               'station': 'BOS', 'lst_offset': -5, 'confirmed_after_z': (19, 0)},
+    'CLIDCA': {'name': 'Washington DC', 'series': 'KXHIGHTDC',
+               'station': 'DCA', 'lst_offset': -5, 'confirmed_after_z': (19, 0)},
 }
-# CLI products carry the same daily max and are the settlement source.
-# We track them too — a CLI max is the strongest confirmation there is.
-CLI_TARGETS = {('CLI' + v['station']): dict(v, is_cli=True)
-               for v in TARGETS.values()}
-for k in CLI_TARGETS:
-    CLI_TARGETS[k].setdefault('is_cli', True)
 
-ALL_TARGETS = {}
-ALL_TARGETS.update(TARGETS)
-ALL_TARGETS.update(CLI_TARGETS)
+# (station, climate_date) -> running state for the day
+#   best        highest observed max seen so far
+#   count       how many CLIs have reported that same best
+#   confirmed   has it met the staleness + cutoff test
+#   fired       have we already sent a paper signal
+#   announced   last max we sent any telegram about (noise control)
+_day = {}
 
-# remembers today's readings so we can take the max across every product.
-# (station, date) -> {'best': f, 'dsm': f, 'cli': f, 'cli_prelim': bool}
-_seen_today = {}
-_all_ids_seen = {}       # DSM/CLI only
+_all_ids_seen = {}       # CLI ids landing on the wire
 _all_products_seen = {}  # every product id, proves the wire is flowing
 _processed = set()       # (awipsid, issue) dedup for the re-scan buffer
 _vis_logged = set()      # (awipsid, issue) dedup for the visibility log
-_dsm_samples_sent = 0    # push first few raw DSMs to telegram for calibration
 
 
 # ---------------------------------------------------------------- telegram
@@ -205,16 +220,14 @@ def telegram(msg):
 
 # ---------------------------------------------------------------- CLI parse
 def _cli_today_temp_section(text):
-    """Narrow a CLI down to the TODAY temperature rows.
+    """Narrow a CLI to the TODAY temperature rows.
 
-    Two things get cut, and both of them have burned us:
-
+    Two cuts, both of which have burned us:
       1. Everything from 'CLIMATE NORMALS FOR TOMORROW' onward. That block
-         contains 'MAXIMUM TEMPERATURE (F)   90' — a 30-year normal that
-         looks exactly like an observation to a loose regex. This is the
-         2026-07-26 bug.
-      2. Everything outside the TEMPERATURE (F) section, so PRECIPITATION,
-         DEGREE DAYS and WIND rows can never be mistaken for a temperature.
+         holds 'MAXIMUM TEMPERATURE (F)   90' — a 30-year normal that looks
+         exactly like an observation to a loose regex. This was the bug.
+      2. Everything outside TEMPERATURE (F), so PRECIPITATION, DEGREE DAYS
+         and WIND rows can never be mistaken for a temperature.
     """
     body = re.split(r'CLIMATE\s+NORMALS\s+FOR\s+TOMORROW', text, flags=re.I)[0]
     m = re.search(r'TEMPERATURE\s*\(F\)(.*?)'
@@ -223,14 +236,14 @@ def _cli_today_temp_section(text):
     return m.group(1) if m else body
 
 
-# Observed column, strict: label, value, then the LST time that always
-# follows a real observation. '103R   129 PM'
-_CLI_OBS_STRICT = re.compile(
+# Observed column, strict: label, value, then the LST time that always follows
+# a real observation.  '103R   129 PM'
+_OBS_STRICT = re.compile(
     r'^[ \t]*MAXIMUM[ \t]+(-?\d{1,3}|MM)([RT])?[ \t]+(\d{1,4})[ \t]*(AM|PM)',
     re.I | re.M)
 # Fallback for offices that omit the time. Still line-anchored and still
 # scoped to the TODAY temperature section, so it cannot reach a normal.
-_CLI_OBS_LOOSE = re.compile(
+_OBS_LOOSE = re.compile(
     r'^[ \t]*MAXIMUM[ \t]+(-?\d{1,3}|MM)([RT])?(?=[ \t]|$)', re.I | re.M)
 
 
@@ -238,17 +251,16 @@ def parse_cli_max(text):
     """Observed daily MAXIMUM from a CLI. Returns a dict, or None.
 
     None means WE COULD NOT READ IT. It never means 'here is the closest
-    number I found'. Returning None costs a skipped trade; guessing cost us
-    a 13F error on a record-setting day.
+    number I found'.
 
-    Keys: max_f, flag ('R' record / 'T' trace-tie / ''), time_lst,
-          preliminary (bool).
+    Keys: max_f, flag ('R' record / 'T' tie / ''), time_lst, lst_minutes
+          (minutes past LST midnight, or None), preliminary (bool).
     """
     sec = _cli_today_temp_section(text)
-    m = _CLI_OBS_STRICT.search(sec)
+    m = _OBS_STRICT.search(sec)
     loose = False
     if not m:
-        m = _CLI_OBS_LOOSE.search(sec)
+        m = _OBS_LOOSE.search(sec)
         loose = True
     if not m:
         return None
@@ -263,14 +275,57 @@ def parse_cli_max(text):
     if not (-60 <= v <= 140):
         return None
 
-    time_lst = '' if loose else f'{m.group(3)} {m.group(4)}'.strip()
+    time_lst, lst_min = '', None
+    if not loose:
+        time_lst = f'{m.group(3)} {m.group(4)}'.strip()
+        lst_min = _hhmm_to_minutes(m.group(3), m.group(4))
+
     return {
         'max_f': v,
         'flag': (m.group(2) or '').upper(),
         'time_lst': time_lst,
+        'lst_minutes': lst_min,
         # 'VALID TODAY AS OF 0400 PM LOCAL TIME' = running max, not settled.
         'preliminary': bool(re.search(r'VALID\s+TODAY\s+AS\s+OF', text, re.I)),
     }
+
+
+def _hhmm_to_minutes(hhmm, ampm):
+    """'129','PM' -> minutes past LST midnight. '1229','AM' -> 149."""
+    try:
+        s = hhmm.zfill(3)
+        hh, mm = int(s[:-2]), int(s[-2:])
+    except (ValueError, IndexError):
+        return None
+    if not (0 <= mm < 60):
+        return None
+    ampm = (ampm or '').upper()
+    if ampm == 'PM' and hh != 12:
+        hh += 12
+    elif ampm == 'AM' and hh == 12:
+        hh = 0
+    if not (0 <= hh < 24):
+        return None
+    return hh * 60 + mm
+
+
+def observation_staleness_min(cday, lst_minutes, lst_offset, issue_dt):
+    """Minutes between when the max was observed and when the CLI was issued.
+
+    This is the whole confirmation mechanism. The LST column is TRUE STANDARD
+    TIME (verified 2026-07-26: CLI said 129 PM, Wethr showed 2:29 PM for the
+    same observation — exactly the DST hour apart). So the offset applied here
+    is the city's STANDARD offset, never its daylight one.
+
+    Returns minutes, or None if the observation time was unreadable.
+    """
+    if lst_minutes is None or cday is None or issue_dt is None:
+        return None
+    obs_utc = (datetime(cday.year, cday.month, cday.day,
+                        tzinfo=timezone.utc)
+               + timedelta(minutes=lst_minutes)
+               - timedelta(hours=lst_offset))
+    return round((issue_dt - obs_utc).total_seconds() / 60)
 
 
 MONTHS = {m: i + 1 for i, m in enumerate(
@@ -282,22 +337,21 @@ def parse_climate_date(text):
     """The date the product DESCRIBES, which is NOT the issue date.
 
     A CLI issued at 12:17Z on Jul 22 is the summary for Jul 21. Using the
-    issue date matched yesterday's 90F high against TODAY's market and the
-    gate called it 'confirmed + cheap' at 3c. Caught on paper; would have
-    swept 23 contracts on the wrong day live.
+    issue date matched yesterday's high against TODAY's market and the gate
+    called it cheap. Caught on paper; would have swept the wrong day live.
 
     Returns a date, or None. None means SKIP — we do not guess.
     """
+    from datetime import date as _date
+    # Cut the tomorrow-normals block first: it also contains 'FOR TOMORROW'
+    # text that a loose date pattern could latch onto.
+    head = re.split(r'CLIMATE\s+NORMALS\s+FOR\s+TOMORROW', text, flags=re.I)[0]
     pats = [
         r'CLIMATE\s+SUMMARY\s+FOR\s+([A-Z]+)\s+(\d{1,2})\s+(\d{4})',
         r'CLIMATE\s+REPORT\s+FOR\s+([A-Z]+)\s+(\d{1,2})\s+(\d{4})',
         r'SUMMARY\s+FOR\s+([A-Z]+)\s+(\d{1,2})\s+(\d{4})',
         r'\bFOR\s+([A-Z]{3,9})\s+(\d{1,2})\s+(\d{4})\b',
     ]
-    from datetime import date as _date
-    # The tomorrow-normals block also contains 'FOR TOMORROW' text; cut it so
-    # a loose date pattern can never pick up the wrong day.
-    head = re.split(r'CLIMATE\s+NORMALS\s+FOR\s+TOMORROW', text, flags=re.I)[0]
     for pat in pats:
         m = re.search(pat, head, re.IGNORECASE)
         if not m:
@@ -312,48 +366,8 @@ def parse_climate_date(text):
     return None
 
 
-def decode_dsm_max(text):
-    """Decode a coded DSM (NOT plain text — that was an earlier bug).
-
-    A DSM looks like:
-        KDEN DS 1600 26/07 1031329/ 680243// 103/ 68//9771431/00
-                           ^^^ ^^^^ max=103F at 1329 LST
-    The first field after <dd/mm> is <MAX><HHMM>/, second is <MIN><HHMM>/.
-    Temps are 2-3 digits. Returns max_f or None.
-
-    VERIFIED against the real 2026-07-26 KDEN DSM: returns 103. This decoder
-    was not the source of the 90F error.
-    """
-    m = re.search(
-        r'\bDS\s+\d{3,4}\s+\d{2}/\d{2}\s+(\d{2,3})(\d{4})/',
-        text)
-    if m:
-        v = int(m.group(1))
-        if -60 <= v <= 140:
-            return v
-    return None
-
-
-def decode_dsm_date(text, issue_dt):
-    """A DSM body carries 'DD/MM' after the DS marker:
-        KDEN DS 1600 26/07 1031329/ ...   -> day 26, month 07
-    Returns a date. Uses issue year (DSMs don't carry the year). If the
-    DD/MM can't be found, falls back to the issue date's date.
-    """
-    from datetime import date as _date
-    m = re.search(r'\bDS\s+\d{3,4}\s+(\d{2})/(\d{2})\b', text)
-    if m:
-        dd, mm = int(m.group(1)), int(m.group(2))
-        yr = issue_dt.year if issue_dt else _date.today().year
-        try:
-            return _date(yr, mm, dd)
-        except ValueError:
-            pass
-    return issue_dt.date() if issue_dt else None
-
-
 def issue_to_dt(issue):
-    """'2026-07-21T23:17:00Z' -> datetime, or None."""
+    """'2026-07-26T22:36:00Z' -> datetime, or None."""
     try:
         return datetime.fromisoformat(issue.replace('Z', '+00:00'))
     except Exception:
@@ -412,10 +426,11 @@ def match_bracket(brackets, temp_f):
 
 
 # ---------------------------------------------------------------- log
-FIELDS = ['caught_utc', 'awipsid', 'product', 'city', 'station', 'issue',
-          'max_f', 'best_f', 'record_flag', 'obs_time_lst', 'preliminary',
-          'confirmed', 'event', 'bracket', 'sub_title', 'yes_ask_c', 'depth',
-          'decision', 'reason', 'sec_after_issue']
+FIELDS = ['caught_utc', 'awipsid', 'city', 'station', 'issue', 'climate_day',
+          'max_f', 'best_f', 'record_flag', 'obs_time_lst', 'stale_min',
+          'reports_agreeing', 'preliminary', 'state', 'event', 'bracket',
+          'sub_title', 'yes_ask_c', 'depth', 'decision', 'reason',
+          'sec_after_issue']
 
 def write_row(d):
     exists = os.path.exists(LOG_PATH)
@@ -433,127 +448,100 @@ def write_row(d):
 
 
 # ---------------------------------------------------------------- handler
-# station SID (from DSM body 'Kxxx DS') -> config. This is how we ACTUALLY
-# match DSMs: by the site in the body, not the awipsid or issuing office,
-# because one office issues DSMs for many sites under SID-based ids.
-SID_TO_CFG = {}
-for _tk, _cfg in list(TARGETS.items()):
-    SID_TO_CFG[_cfg['station']] = _cfg          # e.g. 'DEN' -> Denver cfg
-
-
 def handle_product(awipsid, cccc, issue, text):
-    cfg = ALL_TARGETS.get(awipsid.upper())
-    # If the awipsid isn't a known target, try matching a DSM by the station
-    # in its BODY ('KDEN DS ...' -> SID 'DEN'). This is the real matcher —
-    # DSMs arrive under SID-based ids issued by various offices.
-    if not cfg and awipsid.upper().startswith('DSM'):
-        mbody = re.search(r'\bK?([A-Z]{3})\s+DS\s+\d', text)
-        if mbody:
-            sid = mbody.group(1)
-            sid = sid[1:] if len(sid) == 4 and sid[0] == 'K' else sid
-            cfg = SID_TO_CFG.get(sid)
+    cfg = TARGETS.get(awipsid.upper())
     if not cfg:
         return
+
     # dedup: the buffer re-scans, so guard against processing the same
     # product twice (same id + same issue time).
-    _dedup_key = (awipsid.upper(), issue)
-    if _dedup_key in _processed:
+    dedup_key = (awipsid.upper(), issue)
+    if dedup_key in _processed:
         return
-    _processed.add(_dedup_key)
+    _processed.add(dedup_key)
 
     now = datetime.now(timezone.utc)
-    is_cli = awipsid.upper().startswith('CLI')
-    ptype = 'CLI' if is_cli else 'DSM'
 
-    # DSMs are CODED numeric strings; CLIs are plain text. Different decoders.
-    rec_flag, obs_time, prelim = '', '', False
-    if is_cli:
-        parsed = parse_cli_max(text)
-        if parsed is None:
-            max_f = None
-        else:
-            max_f = parsed['max_f']
-            rec_flag = parsed['flag']
-            obs_time = parsed['time_lst']
-            prelim = parsed['preliminary']
-    else:
-        max_f = decode_dsm_max(text)
-
-    if max_f is None:
-        log.warning("%s %s — could not parse max. First 400 chars:\n%s",
-                    ptype, cfg['name'], text[:400])
-        telegram(f"⚠️ {cfg['name']} {ptype} — no max parsed, SKIPPED. "
+    parsed = parse_cli_max(text)
+    if parsed is None:
+        log.warning("CLI %s — could not parse observed max, SKIPPING. "
+                    "First 400 chars:\n%s", cfg['name'], text[:400])
+        telegram(f"⚠️ {cfg['name']} CLI — observed max unreadable, skipped. "
                  f"Raw in logs.")
         return
 
+    max_f = parsed['max_f']
     idt = issue_to_dt(issue) or now
     lag = round((now - idt).total_seconds())
 
-    # The climate day is what the product DESCRIBES, not when it was issued.
-    # CLIs carry it as text ('SUMMARY FOR JULY 26 2026'); DSMs carry it as
-    # coded 'DD/MM'. Use the right decoder for each.
-    if is_cli:
-        cday = parse_climate_date(text)
-    else:
-        cday = decode_dsm_date(text, idt)
+    cday = parse_climate_date(text)
     if cday is None:
-        log.warning("%s %s — could not parse climate date, SKIPPING. "
-                    "First 300 chars:\n%s", ptype, cfg['name'], text[:300])
-        telegram(f"⚠️ {cfg['name']} {ptype} — no climate date parsed, "
-                 f"skipped. Raw text in logs.")
+        log.warning("CLI %s — could not parse climate date, SKIPPING. "
+                    "First 300 chars:\n%s", cfg['name'], text[:300])
+        telegram(f"⚠️ {cfg['name']} CLI — no climate date parsed, skipped.")
         return
 
-    stale = (now.date() - cday).days
-    if stale >= 1:
-        log.info("%s %s is for %s (%d day(s) back) — not today's market",
-                 ptype, cfg['name'], cday, stale)
+    stale_days = (now.date() - cday).days
+    stale_min = observation_staleness_min(
+        cday, parsed['lst_minutes'], cfg['lst_offset'], idt)
 
-    # provisional vs confirmed, from the aim table
-    hh, mm = cfg['confirmed_after_z']
-    cutoff_ok = (idt.hour, idt.minute) >= (hh, mm)
+    # ---- running state for this station/day
     key = (cfg['station'], cday)
-    rec = _seen_today.setdefault(key, {})
+    st = _day.setdefault(key, {'best': None, 'count': 0, 'confirmed': False,
+                               'fired': False, 'announced': None})
 
-    # ---- cross-check: DSM and CLI describe the SAME observation. If they
-    # disagree, one of the two parsers is wrong. That is not a market signal,
-    # it is a bug report, and it should never be traded through.
-    rec[ptype.lower()] = max_f
-    mismatch = False
-    if rec.get('dsm') is not None and rec.get('cli') is not None \
-            and rec['dsm'] != rec['cli']:
-        mismatch = True
-        log.error("PARSER MISMATCH %s %s: DSM=%sF CLI=%sF",
-                  cfg['name'], cday, rec['dsm'], rec['cli'])
-        telegram(f"🛑 <b>PARSER MISMATCH — {cfg['name']} {cday}</b>\n"
-                 f"DSM says <b>{rec['dsm']}°F</b>, CLI says "
-                 f"<b>{rec['cli']}°F</b>.\n"
-                 f"Same observation, two answers. One decoder is wrong.\n"
-                 f"All fires for this station/day are blocked.")
-    rec['mismatch'] = rec.get('mismatch', False) or mismatch
-
-    # running max across every product seen for this station/day
-    best = rec.get('best')
-    final_f = max_f if best is None else max(best, max_f)
-    rec['best'] = final_f
-
-    if is_cli:
-        confirmed = 'cli_prelim' if prelim else 'cli_final'
-    elif cutoff_ok:
-        confirmed = 'yes'
+    if st['best'] is None or max_f > st['best']:
+        # new high — the peak is still forming, confirmation resets
+        st['best'] = max_f
+        st['count'] = 1
+        st['confirmed'] = False
+    elif max_f == st['best']:
+        # another independent report agreeing. This is the cross-check.
+        st['count'] += 1
     else:
-        confirmed = 'no'
+        # A running max cannot fall. If it does, either the parser faulted or
+        # the office corrected downward. Either way do not trade through it.
+        log.error("CLI %s %s — max DECREASED %sF -> %sF. Parse fault or "
+                  "office correction. Blocking day.",
+                  cfg['name'], cday, st['best'], max_f)
+        telegram(f"🛑 <b>{cfg['name']} {cday}</b> — reported max fell "
+                 f"{st['best']}°F → {max_f}°F.\nA running max cannot drop. "
+                 f"Day blocked, check the log.")
+        st['blocked'] = True
+
+    best = st['best']
+
+    # ---- confirmation: staleness is the primary test, clock is the backstop
+    hh, mm = cfg['confirmed_after_z']
+    past_cutoff = (idt.hour, idt.minute) >= (hh, mm)
+    stale_ok = stale_min is not None and stale_min >= CONFIRM_STALE_MIN
+    if stale_ok and past_cutoff:
+        st['confirmed'] = True
+
+    corroborated = st['count'] >= 2
+    solo_ok = stale_min is not None and stale_min >= SOLO_STALE_MIN
+
+    if not parsed['preliminary']:
+        state = 'final'
+    elif st['confirmed']:
+        state = 'confirmed' if (corroborated or solo_ok) else 'confirmed_solo'
+    else:
+        state = 'provisional'
 
     row = dict.fromkeys(FIELDS, '')
     row.update(caught_utc=now.strftime('%H:%M:%S'), awipsid=awipsid,
-               product=ptype, city=cfg['name'], station=cfg['station'],
-               issue=issue, max_f=max_f, best_f=final_f,
-               record_flag=rec_flag, obs_time_lst=obs_time,
-               preliminary=('yes' if prelim else ''),
-               confirmed=confirmed, sec_after_issue=lag)
+               city=cfg['name'], station=cfg['station'], issue=issue,
+               climate_day=str(cday), max_f=max_f, best_f=best,
+               record_flag=parsed['flag'], obs_time_lst=parsed['time_lst'],
+               stale_min=('' if stale_min is None else stale_min),
+               reports_agreeing=st['count'],
+               preliminary=('yes' if parsed['preliminary'] else ''),
+               state=state, sec_after_issue=lag)
 
-    log.info("%s %s MAX=%dF (this product %dF%s, confirmed=%s) +%ds",
-             ptype, cfg['name'], final_f, max_f,
-             f' {rec_flag}' if rec_flag else '', confirmed, lag)
+    log.info("CLI %s %s max=%sF%s obs=%s stale=%smin agree=%d state=%s +%ds",
+             cfg['name'], cday, best,
+             f" {parsed['flag']}" if parsed['flag'] else '',
+             parsed['time_lst'] or '?', stale_min, st['count'], state, lag)
 
     # ---- Kalshi side
     event = event_ticker(cfg['series'], cday)
@@ -567,13 +555,11 @@ def handle_product(awipsid, cccc, issue, text):
     if not brackets:
         row.update(decision='SKIP', reason='no brackets')
         write_row(row)
-        telegram(f"🔆 <b>{cfg['name']} {ptype}</b> max {final_f}°F "
-                 f"(+{lag}s)\nno open brackets")
         return
 
-    m = match_bracket(brackets, final_f)
+    m = match_bracket(brackets, best)
     if not m:
-        row.update(decision='SKIP', reason=f'no bracket for {final_f}F')
+        row.update(decision='SKIP', reason=f'no bracket for {best}F')
         write_row(row)
         return
 
@@ -583,19 +569,24 @@ def handle_product(awipsid, cccc, issue, text):
                yes_ask_c=yes_c, depth=depth)
 
     # ---- gate
-    if rec.get('mismatch'):
-        fire, why = False, 'DSM/CLI parser mismatch — blocked'
-    elif is_cli:
-        # CLI is the SETTLEMENT source, but by the time today's final CLI
-        # lands the market is typically done. Log it so we can measure whether
-        # CLIs ever arrive early enough to be tradeable — but never fire on
-        # one. DSM is the signal; CLI is the scoreboard.
-        fire, why = False, ('CLI preliminary — running max, log only'
-                            if prelim else 'CLI — log only, DSM fires')
-    elif stale >= 1:
-        fire, why = False, f'product is for {cday}, {stale}d old — not today'
-    elif confirmed == 'no':
-        fire, why = False, 'provisional (pre-peak DSM) — watch only'
+    if st.get('blocked'):
+        fire, why = False, 'day blocked — max decreased'
+    elif st['fired']:
+        fire, why = False, 'already signalled this day'
+    elif stale_days >= 1:
+        fire, why = False, f'product is for {cday}, {stale_days}d old'
+    elif not parsed['preliminary']:
+        # The settled CLI lands after midnight, long after the market closed.
+        # It is the scoreboard, not a signal.
+        fire, why = False, 'final CLI — settlement scoreboard, not tradeable'
+    elif stale_min is None:
+        fire, why = False, 'no observation time — cannot confirm peak passed'
+    elif not st['confirmed']:
+        fire, why = False, (f'running max, obs only {stale_min}min old '
+                            f'(need {CONFIRM_STALE_MIN}) — peak may still form')
+    elif not (corroborated or solo_ok):
+        fire, why = False, (f'unconfirmed by a second report and only '
+                            f'{stale_min}min stale (solo needs {SOLO_STALE_MIN})')
     elif yes_c is None:
         fire, why = False, 'no price'
     elif yes_c >= MAX_YES_PCT:
@@ -603,35 +594,36 @@ def handle_product(awipsid, cccc, issue, text):
     elif depth <= 0:
         fire, why = False, 'no depth'
     else:
-        fire, why = True, 'confirmed + cheap'
+        fire, why = True, (f'peak passed {stale_min}min ago, '
+                           f'{st["count"]} report(s) agree, cheap')
 
     row['reason'] = why
     row['decision'] = 'PAPER_BUY' if fire else 'SKIP'
     write_row(row)
 
-    if is_cli:
-        # scoreboard, not a signal — and say plainly which kind it is.
-        if prelim:
-            telegram(f"📋 {cfg['name']} CLI <i>preliminary</i> max "
-                     f"<b>{final_f}°F</b> ({cday})"
-                     f"{' RECORD' if rec_flag == 'R' else ''} — running "
-                     f"value as of issuance, not settled")
-        else:
-            telegram(f"📋 {cfg['name']} CLI settled max <b>{final_f}°F</b> "
-                     f"({cday}){' RECORD' if rec_flag == 'R' else ''} "
-                     f"— reference only")
-        return
-
-    tag = ('📝 <b>PAPER BUY</b>' if fire else '⏭️ SKIP')
-    telegram(
-        f"{tag} — {cfg['name']} {ptype}\n"
-        f"max <b>{final_f}°F</b> ({confirmed})\n"
-        f"{m.get('yes_sub_title')} @ {yes_c}¢  depth {depth}\n"
-        f"{m['ticker']}\n"
-        f"+{lag}s after issue\n"
-        f"{why}\n"
-        f"— paper only, no order —"
-    )
+    # ---- telegram, state-change only.
+    # Every city reports several times a day. Pinging on all of them buries
+    # the one message that matters.
+    if fire:
+        st['fired'] = True
+        telegram(
+            f"📝 <b>PAPER BUY</b> — {cfg['name']}\n"
+            f"max <b>{best}°F</b>"
+            f"{' RECORD' if parsed['flag'] == 'R' else ''} "
+            f"at {parsed['time_lst']} LST\n"
+            f"peak passed {stale_min}min before issue, "
+            f"{st['count']} report(s) agree\n"
+            f"{m.get('yes_sub_title')} @ {yes_c}¢  depth {depth}\n"
+            f"{m['ticker']}\n"
+            f"+{lag}s after issue\n"
+            f"— paper only, no order —")
+        st['announced'] = best
+    elif st['announced'] != best:
+        # new number for the day — one quiet line, then silence until it moves
+        telegram(f"📋 {cfg['name']} {cday} max <b>{best}°F</b>"
+                 f"{' RECORD' if parsed['flag'] == 'R' else ''} "
+                 f"({state}) — {why}")
+        st['announced'] = best
 
 
 # ---------------------------------------------------------------- xmpp
@@ -657,9 +649,6 @@ def answer_pings(sock, text, send):
 def parse_nwws_message(data_bytes):
     """Product text lives in <x xmlns='nwws-oi'>, NOT <body>.
 
-    Returns the byte offset of the end of the LAST COMPLETE </x> stanza, so
-    the caller can discard only what it has fully consumed.
-
     THIS IS THE BUG THAT KILLED THE OLD BOT: the room JID itself contains the
     string 'nwws-oi', so a naive `if b'nwws-oi' in buf: truncate` fires on
     every stanza — including partial ones — and chops the opening
@@ -669,68 +658,33 @@ def parse_nwws_message(data_bytes):
     text = data_bytes.decode('utf-8', errors='ignore')
     if 'nwws-oi' not in text:
         return 0
-    last_end = 0
     pattern = r'<x[^>]+xmlns=["\']nwws-oi["\'][^>]*>(.*?)</x>'
     for match in re.finditer(pattern, text, re.DOTALL):
-        last_end = match.end()
         full_x = match.group(0)
         product_text = match.group(1).strip()
-        # awipsid can be missing, spaced, or lowercase on some products
-        # (notably DSMs, which killed the old assumption). Allow spaces and
-        # any case, then normalise. If still absent, DON'T skip — try to
-        # recover the id from the product body's first line (e.g. 'KDEN DS').
         aid = re.search(r'awipsid=["\']([A-Za-z0-9 ]+)["\']', full_x)
         ccc = re.search(r'cccc=["\']([A-Za-z0-9]+)["\']', full_x)
         iss = re.search(r'issue=["\']([^"\']+)["\']', full_x)
-        if aid:
-            awipsid = aid.group(1).replace(' ', '').upper()
-        else:
-            # recover: a DSM body starts '<SID> DS <time>'. Build DSM<SID>.
-            mds = re.search(r'\b(K?[A-Z]{3})\s+DS\s+\d', product_text)
-            if mds:
-                sid = mds.group(1)
-                sid = sid[1:] if len(sid) == 4 and sid[0] == 'K' else sid
-                awipsid = 'DSM' + sid
-            else:
-                continue
-
-        # Visibility with dedup on (id, issue) so the re-scan buffer doesn't
-        # spam the same product every recv.
-        _all_products_seen[awipsid] = _all_products_seen.get(awipsid, 0) + 1
-        _vis_key = (awipsid, iss.group(1) if iss else '')
+        if not aid:
+            continue
+        awipsid = aid.group(1).replace(' ', '').upper()
         office = ccc.group(1) if ccc else ''
-        # ONLY DSM/CLI for the normal log.
-        interesting = awipsid.startswith(('DSM', 'CLI'))
 
-        if interesting and _vis_key not in _vis_logged:
-            _vis_logged.add(_vis_key)
+        _all_products_seen[awipsid] = _all_products_seen.get(awipsid, 0) + 1
+        vis_key = (awipsid, iss.group(1) if iss else '')
+
+        # Log every CLI id we see, tracked or not, so missing city mappings
+        # surface from the tape instead of being guessed.
+        if awipsid.startswith('CLI') and vis_key not in _vis_logged:
+            _vis_logged.add(vis_key)
             _all_ids_seen[awipsid] = _all_ids_seen.get(awipsid, 0) + 1
-            if awipsid.startswith('DSM'):
-                # DSMs are coded — capture the raw string so the decoder can
-                # be calibrated against real products, not guesses.
-                body = product_text.strip().replace('\n', ' ')[:200]
-                decoded = decode_dsm_max(product_text)
-                log.info("*** DSM %s office=%s decoded_max=%s ***\n    RAW: %s",
-                         awipsid, office, decoded, body)
-                global _dsm_samples_sent
-                if _dsm_samples_sent < 5:
-                    _dsm_samples_sent += 1
-                    telegram(f"🔬 <b>DSM SAMPLE {_dsm_samples_sent}/5</b>\n"
-                             f"{awipsid} ({office})\n"
-                             f"decoded max: <b>{decoded}</b>\n"
-                             f"<code>{body[:180]}</code>")
-            else:
-                parsed = parse_cli_max(product_text)
-                log.info("*** %s office=%s parsed_max=%s ***",
-                         awipsid, office,
-                         parsed['max_f'] if parsed else None)
+            if awipsid not in TARGETS:
+                log.info("*** untracked CLI %s office=%s ***", awipsid, office)
 
-        # Route to handler if it's a known target OR any DSM (handler does
-        # body-based station matching for DSMs under SID-based ids).
-        if awipsid.upper() in ALL_TARGETS or awipsid.upper().startswith('DSM'):
-            handle_product(awipsid, ccc.group(1) if ccc else '',
+        if awipsid in TARGETS:
+            handle_product(awipsid, office,
                            iss.group(1) if iss else '', product_text)
-    return last_end
+    return 0
 
 
 def xmpp_connect():
@@ -824,11 +778,12 @@ def xmpp_connect():
                        f'</x></presence>')
 
             log.info(f"Joined {NWWS_ROOM} as {NWWS_NICK} — listening...")
-            telegram("✅ <b>DSM HIGHS BOT — PAPER</b>\n"
-                     f"{len(TARGETS)} DSM targets + CLI confirmations\n"
-                     "CLI parser fixed: reads the OBSERVED column, not the\n"
-                     "tomorrow-normals block. Preliminary CLIs now labelled.\n"
-                     "DSM/CLI mismatch blocks all fires for that station/day.\n"
+            telegram("✅ <b>CLI HIGHS BOT — PAPER</b>\n"
+                     f"{len(TARGETS)} cities on the climate-report stream.\n"
+                     f"Locks the high off observation staleness: peak must be "
+                     f"{CONFIRM_STALE_MIN}min behind issuance, and either a "
+                     f"second report agrees or it is {SOLO_STALE_MIN}min stale.\n"
+                     "Telegram on state change only.\n"
                      "No order layer — cannot trade.")
 
             sock.settimeout(15)
@@ -851,12 +806,12 @@ def xmpp_connect():
                     log.warning("No products 5min — stream dead, reconnect")
                     break
 
-                # hourly: report which DSM/CLI ids we've actually seen, so
-                # we LEARN the real awips ids instead of guessing them
+                # hourly: which CLI ids are actually landing. Missing cities
+                # show up here rather than being guessed at.
                 if time.time() - last_report > 3600 and _all_ids_seen:
                     top = sorted(_all_ids_seen.items(),
                                  key=lambda kv: -kv[1])[:40]
-                    log.info("DSM/CLI ids seen: %s", top)
+                    log.info("CLI ids seen: %s", top)
                     last_report = time.time()
 
                 try:
@@ -870,12 +825,9 @@ def xmpp_connect():
                     answer_pings(sock, text, send)
 
                     # Drain COMPLETE stanzas from the FRONT of the buffer as
-                    # they arrive. DSMs come in dense bursts (30+ at 12:16Z);
-                    # the old 256KB rolling re-scan overflowed and the trim
-                    # chopped the front of the batch, losing all but a few.
-                    # Now: repeatedly pull the earliest complete
-                    # </message> (or </x></message>) off the front, process it,
-                    # and remove it — so no burst can overflow anything.
+                    # they arrive. Products come in dense bursts; the old
+                    # 256KB rolling re-scan overflowed and the trim chopped
+                    # the front of the batch, losing all but a few.
                     if b'nwws-oi' in buf:
                         last_product = time.time()
                     while True:
@@ -886,9 +838,9 @@ def xmpp_connect():
                         stanza, buf = buf[:end], buf[end:]
                         if b'nwws-oi' in stanza:
                             parse_nwws_message(stanza)
-                    # safety: if no </message> yet but buffer is huge, the
-                    # stream may use bare stanzas — fall back to draining by
-                    # </x> so we still never accumulate unbounded.
+                    # safety: if no </message> yet but the buffer is huge, the
+                    # stream may use bare stanzas — drain by </x> so we never
+                    # accumulate unbounded.
                     if len(buf) > 524288:
                         while True:
                             ex = buf.find(b'</x>')
@@ -902,8 +854,9 @@ def xmpp_connect():
                             buf = buf[-131072:]
 
                     if chunks % 500 == 0:
-                        log.info("%d chunks | %d products seen | %d distinct DSM/CLI ids",
-                                 chunks, len(_all_products_seen), len(_all_ids_seen))
+                        log.info("%d chunks | %d products | %d distinct CLI ids",
+                                 chunks, len(_all_products_seen),
+                                 len(_all_ids_seen))
                 except socket.timeout:
                     try:
                         send(sock, ' ')
@@ -929,6 +882,6 @@ if __name__ == '__main__':
     if not NWWS_PASSWORD:
         log.error("NWWS_OI_PASSWORD not set")
         exit(1)
-    log.info("DSM HIGHS BOT — PAPER ONLY, no order layer")
-    log.info(f"{len(TARGETS)} DSM targets, log -> {LOG_PATH}")
+    log.info("CLI HIGHS BOT — PAPER ONLY, no order layer")
+    log.info(f"{len(TARGETS)} cities, log -> {LOG_PATH}")
     xmpp_connect()
