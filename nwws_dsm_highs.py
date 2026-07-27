@@ -448,6 +448,23 @@ def write_row(d):
 
 
 # ---------------------------------------------------------------- handler
+def _market_note(st, cfg, msg):
+    """Report a market-side problem, once per city per day per distinct msg.
+
+    The weather half of this bot can be perfectly healthy while the Kalshi
+    half fails — bad event ticker, market not open yet, temp outside every
+    listed bracket. Those used to be silent returns, which made a working
+    feed indistinguishable from a dead one. Now they speak, but only once,
+    so a persistent problem doesn't turn into a notification flood.
+    """
+    seen = st.setdefault('market_notes', set())
+    if msg in seen:
+        return
+    seen.add(msg)
+    log.warning("MARKET %s — %s", cfg['name'], msg)
+    telegram(f"⚠️ {cfg['name']} — weather data fine, market side: {msg}")
+
+
 def handle_product(awipsid, cccc, issue, text):
     cfg = TARGETS.get(awipsid.upper())
     if not cfg:
@@ -543,6 +560,24 @@ def handle_product(awipsid, cccc, issue, text):
              f" {parsed['flag']}" if parsed['flag'] else '',
              parsed['time_lst'] or '?', stale_min, st['count'], state, lag)
 
+    # ---- ANNOUNCE FIRST, before anything market-side can fail.
+    #
+    # This ordering is deliberate and was learned the hard way. The previous
+    # version did Kalshi first and announced last, with three silent returns
+    # in between (lookup error / no brackets / no matching bracket). Any of
+    # them made a perfectly healthy feed look stone dead, so 'no messages'
+    # meant either 'nothing happened' or 'everything is broken' with no way
+    # to tell them apart from the outside.
+    #
+    # Now the weather side always speaks. Market problems get their own
+    # message rather than swallowing the whole report.
+    if st['announced'] != best:
+        telegram(f"📋 {cfg['name']} {cday} max <b>{best}°F</b>"
+                 f"{' RECORD' if parsed['flag'] == 'R' else ''} "
+                 f"({state}, obs {parsed['time_lst'] or '?'} LST, "
+                 f"{stale_min}min stale, {st['count']} report(s))")
+        st['announced'] = best
+
     # ---- Kalshi side
     event = event_ticker(cfg['series'], cday)
     row['event'] = event
@@ -551,16 +586,20 @@ def handle_product(awipsid, cccc, issue, text):
     except Exception as e:
         row.update(decision='ERROR', reason=str(e)[:60])
         write_row(row)
+        _market_note(st, cfg, f"Kalshi lookup failed: {str(e)[:60]}")
         return
     if not brackets:
         row.update(decision='SKIP', reason='no brackets')
         write_row(row)
+        _market_note(st, cfg, f"no active brackets for {event}")
         return
 
     m = match_bracket(brackets, best)
     if not m:
         row.update(decision='SKIP', reason=f'no bracket for {best}F')
         write_row(row)
+        _market_note(st, cfg, f"{best}°F matches no open bracket "
+                              f"({len(brackets)} listed)")
         return
 
     yes_c = dollars(m.get('yes_ask_dollars'))
@@ -617,12 +656,6 @@ def handle_product(awipsid, cccc, issue, text):
             f"{m['ticker']}\n"
             f"+{lag}s after issue\n"
             f"— paper only, no order —")
-        st['announced'] = best
-    elif st['announced'] != best:
-        # new number for the day — one quiet line, then silence until it moves
-        telegram(f"📋 {cfg['name']} {cday} max <b>{best}°F</b>"
-                 f"{' RECORD' if parsed['flag'] == 'R' else ''} "
-                 f"({state}) — {why}")
         st['announced'] = best
 
 
