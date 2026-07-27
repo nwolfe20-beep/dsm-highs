@@ -142,10 +142,28 @@ NWWS_PORT = 5222
 NWWS_ROOM = 'nwws@conference.nwws-oi.weather.gov'
 NWWS_NICK = os.environ.get('NWWS_OI_NICK', 'clihigh1')
 
-TG_TOKEN = os.environ.get('CLI_TELEGRAM_TOKEN',
-                          os.environ.get('TELEGRAM_BOT_TOKEN', ''))
-TG_CHAT = os.environ.get('CLI_TELEGRAM_CHAT_ID',
-                         os.environ.get('TELEGRAM_CHAT_ID', ''))
+def _first_env(*names):
+    """First non-empty value among these env var names.
+
+    The var names have drifted across rebuilds (DSM_*, CLI_*, bare
+    TELEGRAM_*). On 2026-07-27 a rename to CLI_* silently broke Telegram for
+    a whole afternoon: the bot was healthy, parsing correctly, and printing
+    every message to stdout instead of sending it, because telegram() falls
+    back to print() when the token is empty. Accept all the historical names
+    rather than make the deploy depend on remembering which generation of
+    variable is set in Railway.
+    """
+    for n in names:
+        v = os.environ.get(n, '').strip()
+        if v:
+            return v
+    return ''
+
+
+TG_TOKEN = _first_env('CLI_TELEGRAM_TOKEN', 'DSM_TELEGRAM_TOKEN',
+                      'TELEGRAM_BOT_TOKEN', 'TELEGRAM_TOKEN')
+TG_CHAT = _first_env('CLI_TELEGRAM_CHAT_ID', 'DSM_TELEGRAM_CHAT_ID',
+                     'TELEGRAM_CHAT_ID', 'TELEGRAM_CHAT')
 LOG_PATH = os.environ.get('CLI_LOG', '/tmp/cli_highs.csv')
 
 KALSHI = 'https://api.elections.kalshi.com/trade-api/v2'
@@ -957,4 +975,18 @@ if __name__ == '__main__':
         exit(1)
     log.info("CLI HIGHS BOT — PAPER ONLY, no order layer")
     log.info(f"{len(TARGETS)} cities, log -> {LOG_PATH}")
+    if not TG_TOKEN or not TG_CHAT:
+        # Do not let this be a quiet fallback. A bot that prints its alerts
+        # to stdout looks identical to a working one in the logs and sends
+        # you nothing.
+        log.error("=" * 62)
+        log.error("TELEGRAM NOT CONFIGURED — alerts will only print to stdout")
+        log.error("  token set: %s   chat set: %s",
+                  bool(TG_TOKEN), bool(TG_CHAT))
+        log.error("  set CLI_TELEGRAM_TOKEN / CLI_TELEGRAM_CHAT_ID")
+        log.error("  (DSM_* and bare TELEGRAM_* names also accepted)")
+        log.error("=" * 62)
+    else:
+        log.info("Telegram configured (token %s..., chat %s)",
+                 TG_TOKEN[:8], TG_CHAT)
     xmpp_connect()
