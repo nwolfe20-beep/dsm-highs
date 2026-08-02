@@ -656,101 +656,51 @@ def handle_product(awipsid, cccc, issue, text):
 
     # ---- ANNOUNCE FIRST, before anything market-side can fail.
     #
-    # This ordering is deliberate and was learned the hard way. The previous
-    # version did Kalshi first and announced last, with three silent returns
-    # in between (lookup error / no brackets / no matching bracket). Any of
-    # them made a perfectly healthy feed look stone dead, so 'no messages'
-    # meant either 'nothing happened' or 'everything is broken' with no way
-    # to tell them apart from the outside.
-    #
-    # Now the weather side always speaks. Market problems get their own
-    # message rather than swallowing the whole report.
+    # 2026-08-02: changed to pull the Kalshi price INTO this report instead
+    # of gating it behind fire/skip logic. The gate's confirm requirement
+    # (90min+ staleness) was consistently landing after the market had
+    # already repriced past 55c on afternoon highs — every real catch so
+    # far skipped on price, never on confirmation. Rather than keep chasing
+    # gate tuning at this hour, this just reports temp + price + timing on
+    # every state change. No buy/skip decision — that's a manual call now.
+    event = event_ticker(cfg['series'], cday)
+    row['event'] = event
+    price_txt = ''
+    try:
+        brackets = get_brackets(event)
+        m = match_bracket(brackets, best) if brackets else None
+        if m:
+            yes_c = dollars(m.get('yes_ask_dollars'))
+            depth = int(float(m.get('yes_ask_size_fp') or 0))
+            row.update(bracket=m['ticker'], sub_title=m.get('yes_sub_title', ''),
+                       yes_ask_c=yes_c, depth=depth)
+            price_txt = (f"\n{m.get('yes_sub_title')} @ {yes_c}¢  "
+                        f"depth {depth}\n{m['ticker']}")
+        elif brackets:
+            price_txt = f"\n(no bracket contains {best}°F)"
+        else:
+            price_txt = f"\n(no active brackets for {event})"
+    except Exception as e:
+        price_txt = f"\n(Kalshi lookup failed: {str(e)[:60]})"
+        row.update(decision='ERROR', reason=str(e)[:60])
+
     if st['announced'] != best:
         telegram(f"📋 {cfg['name']} {cday} max <b>{best}°F</b>"
                  f"{' RECORD' if parsed['flag'] == 'R' else ''} "
                  f"({state}, obs {parsed['time_lst'] or '?'} LST, "
-                 f"{stale_min}min stale, {st['count']} report(s))")
+                 f"{stale_min}min stale, {st['count']} report(s))"
+                 f"{price_txt}")
         st['announced'] = best
 
-    # ---- Kalshi side
-    event = event_ticker(cfg['series'], cday)
-    row['event'] = event
-    try:
-        brackets = get_brackets(event)
-    except Exception as e:
-        row.update(decision='ERROR', reason=str(e)[:60])
-        write_row(row)
-        _market_note(st, cfg, f"Kalshi lookup failed: {str(e)[:60]}")
-        return
-    if not brackets:
-        row.update(decision='SKIP', reason='no brackets')
-        write_row(row)
-        _market_note(st, cfg, f"no active brackets for {event}")
-        return
-
-    m = match_bracket(brackets, best)
-    if not m:
-        row.update(decision='SKIP', reason=f'no bracket for {best}F')
-        write_row(row)
-        _market_note(st, cfg, f"{best}°F matches no open bracket "
-                              f"({len(brackets)} listed)")
-        return
-
-    yes_c = dollars(m.get('yes_ask_dollars'))
-    depth = int(float(m.get('yes_ask_size_fp') or 0))
+    row.update(decision=row.get('decision') or 'REPORT', reason='report only')
+    write_row(row)
+    return
     row.update(bracket=m['ticker'], sub_title=m.get('yes_sub_title', ''),
                yes_ask_c=yes_c, depth=depth)
 
-    # ---- gate
-    if st.get('blocked'):
-        fire, why = False, 'day blocked — max decreased'
-    elif st['fired']:
-        fire, why = False, 'already signalled this day'
-    elif stale_days >= 1:
-        fire, why = False, f'product is for {cday}, {stale_days}d old'
-    elif not parsed['preliminary']:
-        # The settled CLI lands after midnight, long after the market closed.
-        # It is the scoreboard, not a signal.
-        fire, why = False, 'final CLI — settlement scoreboard, not tradeable'
-    elif stale_min is None:
-        fire, why = False, 'no observation time — cannot confirm peak passed'
-    elif not st['confirmed']:
-        fire, why = False, (f'running max, obs only {stale_min}min old '
-                            f'(need {CONFIRM_STALE_MIN}) — peak may still form')
-    elif not (corroborated or solo_ok):
-        fire, why = False, (f'unconfirmed by a second report and only '
-                            f'{stale_min}min stale (solo needs {SOLO_STALE_MIN})')
-    elif yes_c is None:
-        fire, why = False, 'no price'
-    elif yes_c >= MAX_YES_PCT:
-        fire, why = False, f'repriced {yes_c}c >= {MAX_YES_PCT}c'
-    elif depth <= 0:
-        fire, why = False, 'no depth'
-    else:
-        fire, why = True, (f'peak passed {stale_min}min ago, '
-                           f'{st["count"]} report(s) agree, cheap')
-
-    row['reason'] = why
-    row['decision'] = 'PAPER_BUY' if fire else 'SKIP'
-    write_row(row)
-
-    # ---- telegram, state-change only.
-    # Every city reports several times a day. Pinging on all of them buries
-    # the one message that matters.
-    if fire:
-        st['fired'] = True
-        telegram(
-            f"📝 <b>PAPER BUY</b> — {cfg['name']}\n"
-            f"max <b>{best}°F</b>"
-            f"{' RECORD' if parsed['flag'] == 'R' else ''} "
-            f"at {parsed['time_lst']} LST\n"
-            f"peak passed {stale_min}min before issue, "
-            f"{st['count']} report(s) agree\n"
-            f"{m.get('yes_sub_title')} @ {yes_c}¢  depth {depth}\n"
-            f"{m['ticker']}\n"
-            f"+{lag}s after issue\n"
-            f"— paper only, no order —")
-        st['announced'] = best
+    # ---- decision gate removed 2026-08-02 — see the note above the
+    # ANNOUNCE block. This bot now reports every state change with temp,
+    # price, and timing. Whether that's tradeable is a manual call.
 
 
 # ---------------------------------------------------------------- xmpp
