@@ -164,7 +164,18 @@ TG_TOKEN = _first_env('CLI_TELEGRAM_TOKEN', 'DSM_TELEGRAM_TOKEN',
                       'TELEGRAM_BOT_TOKEN', 'TELEGRAM_TOKEN')
 TG_CHAT = _first_env('CLI_TELEGRAM_CHAT_ID', 'DSM_TELEGRAM_CHAT_ID',
                      'TELEGRAM_CHAT_ID', 'TELEGRAM_CHAT')
-LOG_PATH = os.environ.get('CLI_LOG', '/tmp/cli_highs.csv')
+LOG_PATH = os.environ.get('CLI_LOG', '/data/cli_highs.csv')
+# NOT /tmp. /tmp is wiped on every Railway restart/redeploy — this bot has
+# redeployed multiple times today alone (connection fix, Telegram fix), and
+# on ephemeral storage every one of those wipes any paper trades logged so
+# far with no error anywhere. A working PAPER_BUY write and a silently
+# vanished one look identical from inside the bot. /data matches the
+# persistent-volume convention order_layer.py already uses for
+# LIVE_FIRED_PATH.
+#
+# This only actually persists if a Railway Volume is mounted at /data for
+# THIS service. Setting CLI_LOG to point elsewhere doesn't fix anything
+# unless that path is also a real mounted volume, not local container disk.
 
 KALSHI = 'https://api.elections.kalshi.com/trade-api/v2'
 UA = {'User-Agent': 'cli-highs/2.0'}
@@ -484,6 +495,50 @@ def write_row(d):
             w.writerow(d)
     except Exception as e:
         log.error(f"csv: {e}")
+
+
+def check_log_persistence():
+    """Proof, not an assumption, that LOG_PATH survives a restart.
+
+    Writes/reads a small boot-counter file next to LOG_PATH. If a marker
+    from a PREVIOUS boot is found, the path is confirmed persistent — loud
+    success, once, in the logs. If no marker is found, this is either the
+    very first boot ever, or LOG_PATH is on ephemeral storage and every
+    prior boot's marker (and every paper trade with it) was already wiped.
+    Can't distinguish those two cases from inside a single boot — but it can
+    make sure you're TOLD there's something to check, instead of quietly
+    losing trades the way /tmp did.
+    """
+    marker = os.path.join(os.path.dirname(LOG_PATH) or '.', '.cli_boot_marker')
+    prev_boots = None
+    try:
+        with open(marker) as f:
+            prev_boots = f.read().strip()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Could not read boot marker: %s", e)
+
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH) or '.', exist_ok=True)
+        count = int(prev_boots) + 1 if prev_boots and prev_boots.isdigit() else 1
+        with open(marker, 'w') as f:
+            f.write(str(count))
+        if prev_boots is None:
+            log.warning("LOG PERSISTENCE UNCONFIRMED — no marker from a "
+                       "prior boot at %s. If this bot has redeployed before "
+                       "today, this path is NOT surviving restarts.", marker)
+            telegram(f"⚠️ <b>Log persistence unconfirmed</b>\n{LOG_PATH}\n"
+                     f"No marker from a previous boot found. If this bot "
+                     f"has redeployed before, paper trades on the old path "
+                     f"were lost. Confirm a Railway Volume is mounted here.")
+        else:
+            log.info("LOG PERSISTENCE confirmed — boot #%d, path survived "
+                     "a restart: %s", count, LOG_PATH)
+    except Exception as e:
+        log.error("LOG PERSISTENCE CHECK FAILED: %s", e)
+        telegram(f"🛑 <b>Cannot write to log path</b>\n{LOG_PATH}\n{e}\n"
+                 f"Paper trades will not be recorded at all.")
 
 
 # ---------------------------------------------------------------- handler
@@ -975,6 +1030,7 @@ if __name__ == '__main__':
         exit(1)
     log.info("CLI HIGHS BOT — PAPER ONLY, no order layer")
     log.info(f"{len(TARGETS)} cities, log -> {LOG_PATH}")
+    check_log_persistence()
     if not TG_TOKEN or not TG_CHAT:
         # Do not let this be a quiet fallback. A bot that prints its alerts
         # to stdout looks identical to a working one in the logs and sends
